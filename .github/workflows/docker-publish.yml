@@ -10,7 +10,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  RELAY_IMAGE: ghcr.io/omnilux-tv/omnilux-relay
+  RELAY_IMAGE: ghcr.io/omnilux-tv/omnilux-relay-runtime
 
 permissions:
   contents: read

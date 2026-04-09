@@ -31,4 +31,4 @@ pnpm build
 - `RELAY_CONTROL_URL` defaults to `https://api.omnilux.tv/functions/v1`
 - `relay.omnilux.tv` is the public ingress owned by `omnilux-edge`
 
-The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay`.
+The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
