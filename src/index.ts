@@ -334,14 +334,11 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
 }
 
 const app = express();
+app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
 app.get('/healthz', (_req, res) => {
-  res.json({
-    ok: true,
-    tunnels: tunnelsByConnectionId.size,
-    sessions: sessionsById.size,
-  });
+  res.json({ ok: true });
 });
 
 const server = createServer(app);
