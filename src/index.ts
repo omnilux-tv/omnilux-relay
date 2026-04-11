@@ -6,6 +6,36 @@ import WebSocket, { WebSocketServer, type RawData } from 'ws';
 
 type JsonRecord = Record<string, unknown>;
 
+type RelayCondition = 'connected' | 'degraded' | 'unauthorized' | 'expired' | 'revoked' | 'unreachable';
+type RelayReasonCode =
+  | 'ok'
+  | 'auth_invalid'
+  | 'token_expired'
+  | 'token_revoked'
+  | 'control_plane_unreachable'
+  | 'control_plane_error'
+  | 'tunnel_missing'
+  | 'session_attach_error'
+  | 'client_socket_error'
+  | 'frame_forwarding_error'
+  | 'socket_error'
+  | 'invalid_register_payload';
+
+interface RelayConditionResult {
+  relayCondition: RelayCondition;
+  reasonCode: RelayReasonCode;
+  detail: string;
+}
+
+interface RelayConditionEvidence {
+  source: 'register' | 'heartbeat' | 'session-attach' | 'close' | 'socket-error';
+  status?: number;
+  error?: string;
+  closeReason?: string;
+  hasActiveTunnel?: boolean;
+  code?: number;
+}
+
 interface TunnelConnection {
   serverId: string;
   connectionId: string;
@@ -66,6 +96,113 @@ const tunnelsByServerId = new Map<string, TunnelConnection>();
 const tunnelsByConnectionId = new Map<string, TunnelConnection>();
 const sessionsById = new Map<string, RelaySession>();
 
+function normalizeLower(value: string | undefined): string {
+  return (value ?? '').toLowerCase();
+}
+
+function hasAny(value: string, terms: readonly string[]): boolean {
+  return terms.some((term) => value.includes(term));
+}
+
+function classifyRelayCondition(evidence: RelayConditionEvidence): RelayConditionResult {
+  const status = evidence.status;
+  const lowerError = normalizeLower(evidence.error);
+  const lowerReason = normalizeLower(evidence.closeReason);
+
+  const revokedTerms = ['revoked', 'token revoked', 'credential revoked', 'revocation', 'invalidated'];
+  const expiredTerms = ['expired', 'expiry', 'token expired', 'session expired', 'jwt expired'];
+  const authTerms = ['unauthorized', 'forbidden', 'invalid bearer', 'invalid token', 'missing token', 'authentication', 'auth'];
+  const unreachableTerms = ['failed to fetch', 'fetch', 'timeout', 'econnrefused', 'network', 'enotfound', 'dns'];
+
+  const message = `${lowerError} ${lowerReason}`;
+
+  if (evidence.hasActiveTunnel === false) {
+    return {
+      relayCondition: 'unreachable',
+      reasonCode: 'tunnel_missing',
+      detail: evidence.error ?? evidence.closeReason ?? 'No active relay tunnel for this server',
+    };
+  }
+
+  if (hasAny(message, revokedTerms)) {
+    return {
+      relayCondition: 'revoked',
+      reasonCode: 'token_revoked',
+      detail: evidence.error ?? evidence.closeReason ?? 'credential revoked',
+    };
+  }
+
+  if (hasAny(message, expiredTerms)) {
+    return {
+      relayCondition: 'expired',
+      reasonCode: 'token_expired',
+      detail: evidence.error ?? evidence.closeReason ?? 'token expired',
+    };
+  }
+
+  if (status === 401 || status === 403 || hasAny(message, authTerms)) {
+    return {
+      relayCondition: 'unauthorized',
+      reasonCode: 'auth_invalid',
+      detail: evidence.error ?? evidence.closeReason ?? 'authentication/authorization rejected',
+    };
+  }
+
+  if (status === 410 || status === 419) {
+    return {
+      relayCondition: 'expired',
+      reasonCode: 'token_expired',
+      detail: evidence.error ?? 'token/session expired',
+    };
+  }
+
+  if ((status !== undefined && status >= 500) || status === 0 || hasAny(message, unreachableTerms)) {
+    return {
+      relayCondition: 'unreachable',
+      reasonCode: 'control_plane_unreachable',
+      detail: evidence.error ?? evidence.closeReason ?? 'control plane unreachable',
+    };
+  }
+
+  if (evidence.source === 'socket-error' || evidence.source === 'close') {
+    return {
+      relayCondition: 'degraded',
+      reasonCode: 'socket_error',
+      detail: evidence.error ?? evidence.closeReason ?? 'transport/socket error',
+    };
+  }
+
+  if (status !== undefined) {
+    return {
+      relayCondition: 'degraded',
+      reasonCode: status >= 400 ? 'control_plane_error' : 'ok',
+      detail: evidence.error ?? 'control-plane returned non-success',
+    };
+  }
+
+  return {
+    relayCondition: 'connected',
+    reasonCode: 'ok',
+    detail: 'ok',
+  };
+}
+
+function relayStatusForControlPlane(condition: RelayCondition): string {
+  return condition === 'connected' ? 'online' : 'degraded';
+}
+
+function toCloseReason(condition: RelayConditionResult, fallback: string): string {
+  return `Relay condition ${condition.relayCondition} (${condition.reasonCode}): ${condition.detail}`;
+}
+
+function addConditionMetadata(condition: RelayConditionResult, extra: JsonRecord): JsonRecord {
+  return {
+    relayCondition: condition.relayCondition,
+    reasonCode: condition.reasonCode,
+    ...extra,
+  };
+}
+
 function getBearerToken(req: { headers: Record<string, string | string[] | undefined> }): string | null {
   const authorization = req.headers.authorization;
   const value = Array.isArray(authorization) ? authorization[0] : authorization;
@@ -122,7 +259,7 @@ async function postControlPlane<T>(
   } catch (error) {
     return {
       ok: false,
-      status: 502,
+      status: 0,
       error: error instanceof Error ? error.message : 'Unknown relay control-plane error',
     };
   }
@@ -132,13 +269,24 @@ function sendJson(socket: WebSocket, payload: JsonRecord) {
   socket.send(JSON.stringify(payload));
 }
 
-function closeSession(sessionId: string, code = 1011, reason = 'Relay session closed') {
+function closeSession(
+  sessionId: string,
+  code = 1011,
+  fallback = 'Relay session closed',
+  condition: RelayConditionResult = {
+    relayCondition: 'degraded',
+    reasonCode: 'session_attach_error',
+    detail: 'Relay session closed',
+  },
+) {
   const session = sessionsById.get(sessionId);
   if (!session) return;
 
   sessionsById.delete(sessionId);
   const tunnel = tunnelsByConnectionId.get(session.tunnelConnectionId);
   tunnel?.sessions.delete(sessionId);
+
+  const reason = toCloseReason(condition, fallback);
 
   if (session.clientSocket.readyState === WebSocket.OPEN || session.clientSocket.readyState === WebSocket.CONNECTING) {
     session.clientSocket.close(code, reason);
@@ -149,11 +297,23 @@ function closeSession(sessionId: string, code = 1011, reason = 'Relay session cl
       type: 'session-close',
       sessionId,
       reason,
+      relayCondition: condition.relayCondition,
+      reasonCode: condition.reasonCode,
     });
   }
+
+  relayWarn(
+    'relay session close issued',
+    addConditionMetadata(condition, {
+      sessionId,
+      serverId: session.serverId,
+      connectionId: session.tunnelConnectionId,
+      closeCode: code,
+    }),
+  );
 }
 
-function dropTunnel(connectionId: string, reason: string) {
+function dropTunnel(connectionId: string, condition: RelayConditionResult): void {
   const tunnel = tunnelsByConnectionId.get(connectionId);
   if (!tunnel) return;
 
@@ -163,15 +323,50 @@ function dropTunnel(connectionId: string, reason: string) {
   }
 
   for (const sessionId of Array.from(tunnel.sessions)) {
-    closeSession(sessionId, 1011, reason);
+    closeSession(sessionId, 1011, toCloseReason(condition, 'Relay tunnel dropped'), condition);
   }
+}
+
+function handleRelayHeartbeatFailure(
+  tunnel: TunnelConnection,
+  response: { status: number; error?: string },
+): RelayConditionResult {
+  const result = classifyRelayCondition({
+    source: 'heartbeat',
+    status: response.status,
+    error: response.error,
+  });
+
+  relayWarn(
+    'relay heartbeat failed',
+    addConditionMetadata(result, {
+      serverId: tunnel.serverId,
+      connectionId: tunnel.connectionId,
+      status: response.status,
+      error: response.error,
+    }),
+  );
+
+  return result;
 }
 
 async function registerTunnel(socket: WebSocket, token: string, payload: JsonRecord) {
   const protocolVersion = Number(payload.protocolVersion);
   if (!Number.isFinite(protocolVersion)) {
-    sendJson(socket, { type: 'error', code: 'INVALID_REGISTER', message: 'protocolVersion is required' });
-    socket.close(1008, 'Invalid register payload');
+    const condition: RelayConditionResult = {
+      relayCondition: 'degraded',
+      reasonCode: 'invalid_register_payload',
+      detail: 'protocolVersion is required',
+    };
+
+    sendJson(socket, {
+      type: 'error',
+      code: 'INVALID_REGISTER',
+      message: condition.detail,
+      relayCondition: condition.relayCondition,
+      reasonCode: condition.reasonCode,
+    });
+    socket.close(1008, toCloseReason(condition, condition.detail));
     return;
   }
 
@@ -190,17 +385,41 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
     metadata: typeof payload.metadata === 'object' && payload.metadata ? payload.metadata : {},
   });
 
+  const condition = response.ok
+    ? ({ relayCondition: 'connected' as const, reasonCode: 'ok' as const, detail: 'register ok' } as RelayConditionResult)
+    : classifyRelayCondition({
+        source: 'register',
+        status: response.status,
+        error: response.error,
+      });
+
   if (!response.ok || !response.data) {
-    sendJson(socket, { type: 'error', code: 'REGISTER_FAILED', message: response.error ?? 'Relay registration failed' });
-    socket.close(1011, 'Relay registration failed');
+    sendJson(socket, {
+      type: 'error',
+      code: 'REGISTER_FAILED',
+      message: condition.detail,
+      relayCondition: condition.relayCondition,
+      reasonCode: condition.reasonCode,
+    });
+    socket.close(1011, toCloseReason(condition, 'Relay registration failed'));
+    relayWarn('relay tunnel register failed',
+      addConditionMetadata(condition, {
+        status: response.status,
+        error: response.error,
+      }));
     return;
   }
 
   const existing = tunnelsByServerId.get(response.data.serverId);
   if (existing) {
-    dropTunnel(existing.connectionId, 'Superseded by a newer tunnel');
+    const superseded = {
+      relayCondition: 'degraded' as const,
+      reasonCode: 'control_plane_error' as const,
+      detail: 'Superseded by a newer tunnel',
+    } satisfies RelayConditionResult;
+    dropTunnel(existing.connectionId, superseded);
     if (existing.socket.readyState === WebSocket.OPEN || existing.socket.readyState === WebSocket.CONNECTING) {
-      existing.socket.close(1012, 'Superseded by a newer tunnel');
+      existing.socket.close(1012, toCloseReason(superseded, 'Superseded by a newer tunnel'));
     }
   }
 
@@ -230,17 +449,28 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
     relaySessionTtlSeconds: response.data.relaySessionTtlSeconds,
   });
 
-  relayLog('relay tunnel registered', {
-    serverId: tunnel.serverId,
-    connectionId,
-    protocolVersion,
-  });
+  relayLog(
+    'relay tunnel registered',
+    addConditionMetadata(condition, {
+      serverId: tunnel.serverId,
+      connectionId,
+      protocolVersion,
+    }),
+  );
 }
 
-async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonRecord) {
+async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonRecord): Promise<RelayConditionResult> {
+  const outgoingCondition: RelayConditionResult = {
+    relayCondition: 'connected',
+    reasonCode: 'ok',
+    detail: 'heartbeat ok',
+  };
+
   const response = await postControlPlane<{ ok: boolean }>('relay-heartbeat', tunnel.token, {
     connectionId: tunnel.connectionId,
-    relayStatus: typeof payload.relayStatus === 'string' ? payload.relayStatus : 'online',
+    relayStatus: relayStatusForControlPlane(outgoingCondition.relayCondition),
+    relayCondition: outgoingCondition.relayCondition,
+    reasonCode: outgoingCondition.reasonCode,
     protocolVersion: typeof payload.protocolVersion === 'number' ? payload.protocolVersion : tunnel.protocolVersion,
     region: typeof payload.region === 'string' ? payload.region : tunnel.region,
     clientVersion: typeof payload.clientVersion === 'string' ? payload.clientVersion : tunnel.clientVersion,
@@ -249,12 +479,10 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
   });
 
   if (!response.ok) {
-    relayWarn('relay heartbeat failed', {
-      serverId: tunnel.serverId,
-      connectionId: tunnel.connectionId,
-      error: response.error,
-    });
+    return handleRelayHeartbeatFailure(tunnel, response);
   }
+
+  return outgoingCondition;
 }
 
 async function attachClientSession(clientSocket: WebSocket, token: string) {
@@ -267,14 +495,35 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
     metadata?: Record<string, unknown>;
   }>('consume-relay-session', token, { connectionId });
 
+  const consumeCondition = response.ok
+    ? { relayCondition: 'connected' as const, reasonCode: 'ok' as const, detail: 'consume ok' } as RelayConditionResult
+    : classifyRelayCondition({
+        source: 'session-attach',
+        status: response.status,
+        error: response.error,
+      });
+
   if (!response.ok || !response.data) {
-    clientSocket.close(4401, response.error ?? 'Invalid relay session');
+    relayWarn('relay client session attach failed',
+      addConditionMetadata(consumeCondition, {
+        error: response.error,
+      }));
+    clientSocket.close(4401, toCloseReason(consumeCondition, 'Invalid relay session'));
     return;
   }
 
   const tunnel = tunnelsByServerId.get(response.data.serverId);
   if (!tunnel) {
-    clientSocket.close(4404, 'No active relay tunnel for this server');
+    const condition: RelayConditionResult = {
+      relayCondition: 'unreachable',
+      reasonCode: 'tunnel_missing',
+      detail: 'No active relay tunnel for this server',
+    };
+    relayWarn('relay client session attach failed - no tunnel',
+      addConditionMetadata(condition, {
+        serverId: response.data.serverId,
+      }));
+    clientSocket.close(4404, toCloseReason(condition, condition.detail));
     return;
   }
 
@@ -304,32 +553,59 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
     serverId: session.serverId,
   });
 
-  relayLog('relay session attached', {
-    serverId: session.serverId,
-    sessionId: session.sessionId,
-    connectionId: tunnel.connectionId,
-  });
+  relayLog(
+    'relay session attached',
+    addConditionMetadata(consumeCondition, {
+      serverId: session.serverId,
+      sessionId: session.sessionId,
+      connectionId: tunnel.connectionId,
+    }),
+  );
 
   clientSocket.on('message', (raw, isBinary) => {
     if (tunnel.socket.readyState !== WebSocket.OPEN) {
-      closeSession(session.sessionId, 1011, 'Relay tunnel is not available');
+      const condition: RelayConditionResult = {
+        relayCondition: 'unreachable',
+        reasonCode: 'tunnel_missing',
+        detail: 'Relay tunnel is not available',
+      };
+      closeSession(session.sessionId, 1011, 'Relay tunnel is not available', condition);
       return;
     }
 
-    sendJson(tunnel.socket, {
-      type: 'session-frame',
-      sessionId: session.sessionId,
-      encoding: isBinary ? 'base64' : 'text',
-      data: isBinary ? rawDataToBuffer(raw).toString('base64') : rawDataToString(raw),
-    });
+    try {
+      sendJson(tunnel.socket, {
+        type: 'session-frame',
+        sessionId: session.sessionId,
+        encoding: isBinary ? 'base64' : 'text',
+        data: isBinary ? rawDataToBuffer(raw).toString('base64') : rawDataToString(raw),
+      });
+    } catch {
+      const condition: RelayConditionResult = {
+        relayCondition: 'degraded',
+        reasonCode: 'frame_forwarding_error',
+        detail: 'Failed to forward frame',
+      };
+      closeSession(session.sessionId, 1011, 'Frame forwarding failed', condition);
+    }
   });
 
   clientSocket.on('close', () => {
-    closeSession(session.sessionId, 1000, 'Client disconnected');
+    const condition: RelayConditionResult = {
+      relayCondition: 'degraded',
+      reasonCode: 'client_socket_error',
+      detail: 'Client disconnected',
+    };
+    closeSession(session.sessionId, 1000, 'Client disconnected', condition);
   });
 
   clientSocket.on('error', () => {
-    closeSession(session.sessionId, 1011, 'Client socket error');
+    const condition: RelayConditionResult = {
+      relayCondition: 'degraded',
+      reasonCode: 'client_socket_error',
+      detail: 'Client socket error',
+    };
+    closeSession(session.sessionId, 1011, 'Client socket error', condition);
   });
 }
 
@@ -348,7 +624,12 @@ const sessionWss = new WebSocketServer({ noServer: true });
 tunnelWss.on('connection', (socket, req) => {
   const token = getBearerToken(req);
   if (!token) {
-    socket.close(4401, 'Missing relay tunnel token');
+    const condition: RelayConditionResult = {
+      relayCondition: 'unauthorized',
+      reasonCode: 'auth_invalid',
+      detail: 'Missing relay tunnel token',
+    };
+    socket.close(4401, toCloseReason(condition, 'Missing relay tunnel token'));
     return;
   }
 
@@ -358,7 +639,16 @@ tunnelWss.on('connection', (socket, req) => {
     if (!tunnelConnectionId) return;
     const tunnel = tunnelsByConnectionId.get(tunnelConnectionId);
     if (!tunnel) return;
-    await handleTunnelHeartbeat(tunnel, {});
+    const condition = await handleTunnelHeartbeat(tunnel, {});
+    if (condition.relayCondition !== 'connected') {
+      relayWarn(
+        'relay heartbeat condition',
+        addConditionMetadata(condition, {
+          serverId: tunnel.serverId,
+          connectionId: tunnel.connectionId,
+        }),
+      );
+    }
   }, RELAY_HEARTBEAT_INTERVAL_MS);
 
   socket.on('message', async (raw) => {
@@ -387,20 +677,28 @@ tunnelWss.on('connection', (socket, req) => {
     }
 
     switch (payload.type) {
-      case 'heartbeat':
-        await handleTunnelHeartbeat(tunnel, payload);
+      case 'heartbeat': {
+        const condition = await handleTunnelHeartbeat(tunnel, payload);
         sendJson(socket, {
           type: 'heartbeat-ack',
           connectionId: tunnel.connectionId,
           receivedAt: new Date().toISOString(),
+          relayCondition: condition.relayCondition,
+          reasonCode: condition.reasonCode,
         });
         break;
+      }
       case 'session-frame': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
         const session = sessionId ? sessionsById.get(sessionId) : null;
         if (!session) return;
         if (session.clientSocket.readyState !== WebSocket.OPEN) {
-          closeSession(session.sessionId, 1000, 'Client socket no longer open');
+          const condition: RelayConditionResult = {
+            relayCondition: 'degraded',
+            reasonCode: 'frame_forwarding_error',
+            detail: 'Client socket no longer open',
+          };
+          closeSession(session.sessionId, 1000, 'Client socket no longer open', condition);
           return;
         }
 
@@ -415,13 +713,13 @@ tunnelWss.on('connection', (socket, req) => {
       }
       case 'session-close': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
-        if (sessionId) {
-          closeSession(
-            sessionId,
-            1000,
-            typeof payload.reason === 'string' ? payload.reason : 'Session closed by server',
-          );
-        }
+        if (!sessionId) break;
+        const condition: RelayConditionResult = {
+          relayCondition: 'degraded',
+          reasonCode: 'session_attach_error',
+          detail: typeof payload.reason === 'string' ? payload.reason : 'Session closed by server',
+        };
+        closeSession(sessionId, 1000, condition.detail, condition);
         break;
       }
       default:
@@ -433,34 +731,73 @@ tunnelWss.on('connection', (socket, req) => {
     }
   });
 
-  socket.on('close', () => {
+  socket.on('close', (code, reasonBuffer) => {
     clearInterval(heartbeatTimer);
-    if (tunnelConnectionId) {
-      relayWarn('relay tunnel disconnected', { connectionId: tunnelConnectionId });
-      dropTunnel(tunnelConnectionId, 'Relay tunnel disconnected');
-    }
+    if (!tunnelConnectionId) return;
+
+    const closeReason = reasonBuffer?.toString();
+    const condition = classifyRelayCondition({
+      source: 'close',
+      code,
+      status: code,
+      closeReason,
+    });
+
+    relayWarn(
+      'relay tunnel disconnected',
+      addConditionMetadata(condition, {
+        connectionId: tunnelConnectionId,
+        closeCode: code,
+      }),
+    );
+    dropTunnel(tunnelConnectionId, condition);
   });
 
   socket.on('error', (error) => {
-    relayError('relay tunnel socket error', {
+    const condition = classifyRelayCondition({
+      source: 'socket-error',
       error: error instanceof Error ? error.message : 'Unknown websocket error',
-      ...(tunnelConnectionId ? { connectionId: tunnelConnectionId } : {}),
     });
+    if (tunnelConnectionId) {
+      relayError(
+        'relay tunnel socket error',
+        addConditionMetadata(condition, {
+          connectionId: tunnelConnectionId,
+        }),
+      );
+    } else {
+      relayError('relay tunnel socket error', {
+        error: error instanceof Error ? error.message : 'Unknown websocket error',
+        relayCondition: condition.relayCondition,
+        reasonCode: condition.reasonCode,
+      });
+    }
   });
 });
 
 sessionWss.on('connection', (socket, req) => {
   const token = getBearerToken(req);
   if (!token) {
-    socket.close(4401, 'Missing relay session token');
+    const condition: RelayConditionResult = {
+      relayCondition: 'unauthorized',
+      reasonCode: 'auth_invalid',
+      detail: 'Missing relay session token',
+    };
+    socket.close(4401, toCloseReason(condition, 'Missing relay session token'));
     return;
   }
 
   attachClientSession(socket, token).catch((error) => {
-    relayError('relay client session attach failed', {
-      error: error instanceof Error ? error.message : 'Unknown session attach error',
-    });
-    socket.close(1011, 'Relay session attach failed');
+    const condition: RelayConditionResult = {
+      relayCondition: 'degraded',
+      reasonCode: 'session_attach_error',
+      detail: error instanceof Error ? error.message : 'Unknown session attach error',
+    };
+    relayError('relay client session attach failed',
+      addConditionMetadata(condition, {
+        error: condition.detail,
+      }));
+    socket.close(1011, toCloseReason(condition, 'Relay session attach failed'));
   });
 });
 
