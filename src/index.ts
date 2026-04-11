@@ -156,19 +156,19 @@ function classifyRelayCondition(evidence: RelayConditionEvidence): RelayConditio
     };
   }
 
-  if ((status !== undefined && status >= 500) || status === 0 || hasAny(message, unreachableTerms)) {
-    return {
-      relayCondition: 'unreachable',
-      reasonCode: 'control_plane_unreachable',
-      detail: evidence.error ?? evidence.closeReason ?? 'control plane unreachable',
-    };
-  }
-
   if (evidence.source === 'socket-error' || evidence.source === 'close') {
     return {
       relayCondition: 'degraded',
       reasonCode: 'socket_error',
       detail: evidence.error ?? evidence.closeReason ?? 'transport/socket error',
+    };
+  }
+
+  if ((status !== undefined && status >= 500) || status === 0 || hasAny(message, unreachableTerms)) {
+    return {
+      relayCondition: 'unreachable',
+      reasonCode: 'control_plane_unreachable',
+      detail: evidence.error ?? evidence.closeReason ?? 'control plane unreachable',
     };
   }
 
@@ -738,8 +738,6 @@ tunnelWss.on('connection', (socket, req) => {
     const closeReason = reasonBuffer?.toString();
     const condition = classifyRelayCondition({
       source: 'close',
-      code,
-      status: code,
       closeReason,
     });
 
