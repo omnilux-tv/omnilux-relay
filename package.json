@@ -11,7 +11,8 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "lint": "tsc -p tsconfig.json --noEmit",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:smoke": "node --test --import tsx tests/relay-runtime.smoke.test.ts"
   },
   "dependencies": {
     "dotenv": "^16.4.7",
