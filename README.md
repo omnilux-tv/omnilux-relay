@@ -11,6 +11,14 @@ This repo owns the remote-access transport layer only:
 
 It does not own billing, auth UI, entitlements, or durable control-plane state. Those remain in `omnilux-cloud`.
 
+## Canonical Contracts
+
+- Relay execution plan: `../omnilux/docs/planning/cross-repo-plans/relay-contract-plan.md`
+- Detailed relay boundary: `../omnilux/docs/relay/relay-control-plane-boundary.md`
+- Shared agent contract: `../omnilux/docs/planning/cross-repo-plans/agent-contracts-plan.md`
+
+Transport changes that alter token, tunnel, session, heartbeat, or condition semantics must update the detailed relay boundary and the relay contract plan in the same change.
+
 ## Development
 
 ```bash
@@ -35,7 +43,7 @@ The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtim
 
 ## Relay health contract
 
-The relay now emits a normalized `relayCondition` value in relay-owned logs, heartbeat payloads, and close messages.
+The relay emits a transport-level `relayCondition` value in relay-owned logs, heartbeat payloads, and close messages. Product surfaces should map these transport conditions to the product-level relay condition vocabulary defined in `../omnilux/docs/relay/relay-control-plane-boundary.md`.
 
 Valid values:
 
@@ -75,3 +83,16 @@ Evidence mapping:
 Control-plane compatibility:
 
 - `relayStatus` remains a compatibility string (`online` / `degraded`), while `relayCondition` + `reasonCode` carries the canonical enum.
+
+Product condition mapping:
+
+| Transport condition | Product condition |
+| --- | --- |
+| `connected` | `online` |
+| `degraded` | `degraded` |
+| `unauthorized` | `not_configured` or `not_entitled`, depending on control-plane reason |
+| `expired` | `waiting_for_tunnel` or `offline`, depending on whether the server can refresh |
+| `revoked` | `not_entitled` or `not_configured`, depending on revocation reason |
+| `unreachable` | `waiting_for_tunnel` or `offline`, depending on whether a tunnel was previously established |
+
+The relay should not invent user-facing copy. Cloud/local UI maps product conditions to trust vocabulary.
