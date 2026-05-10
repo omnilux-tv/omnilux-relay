@@ -2,6 +2,14 @@
 
 Standalone relay runtime for `relay.omnilux.tv`.
 
+## Workspace
+
+This repository is part of the official OmniLux multi-repo workspace. Use the root `omnilux-workspace` repo for onboarding, profiles, and cross-repo contracts:
+
+- Onboarding: `../ONBOARDING.md`
+- Manifest: `../workspace.repositories.json`
+- Contracts: `../contracts/`
+
 This repo owns the remote-access transport layer only:
 
 - server tunnel registration
@@ -13,9 +21,9 @@ It does not own billing, auth UI, entitlements, or durable control-plane state. 
 
 ## Canonical Contracts
 
-- Relay execution plan: `../omnilux/docs/planning/cross-repo-plans/relay-contract-plan.md`
+- Relay execution plan: `../contracts/relay-contract-plan.md`
 - Detailed relay boundary: `../omnilux/docs/relay/relay-control-plane-boundary.md`
-- Shared agent contract: `../omnilux/docs/planning/cross-repo-plans/agent-contracts-plan.md`
+- Shared agent contract: `../contracts/agent-contracts-plan.md`
 
 Transport changes that alter token, tunnel, session, heartbeat, or condition semantics must update the detailed relay boundary and the relay contract plan in the same change.
 
