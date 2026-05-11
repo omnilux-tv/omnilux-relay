@@ -59,6 +59,25 @@ interface RelaySession {
   openedAt: string;
 }
 
+interface RelayGrant {
+  version: string;
+  grantId: string;
+  serverId: string;
+  ownerAccountId: string;
+  subjectAccountId: string;
+  audience: string;
+  purpose: 'remote_http' | 'remote_ws' | 'diagnostic';
+  scope: string[];
+  issuedAt: string;
+  expiresAt: string;
+  sessionLimit: number;
+  entitlementLeaseId: string;
+  issuer: string;
+  keyId: string;
+  signatureAlgorithm: 'ed25519';
+  signature: string;
+}
+
 const relayLog = (message: string, data?: JsonRecord) => {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -91,6 +110,10 @@ const relayError = (message: string, data?: JsonRecord) => {
 const RELAY_PORT = Number(process.env.RELAY_PORT ?? 8090);
 const RELAY_CONTROL_URL = process.env.RELAY_CONTROL_URL ?? 'https://api.omnilux.tv/functions/v1';
 const RELAY_HEARTBEAT_INTERVAL_MS = Number(process.env.RELAY_HEARTBEAT_INTERVAL_MS ?? 30_000);
+const RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL = process.env.RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL?.trim() ?? '';
+const RELAY_GRANT_AUDIENCE = process.env.RELAY_GRANT_AUDIENCE?.trim() || 'relay.omnilux.tv';
+const RELAY_REQUIRE_SIGNED_SESSION_GRANTS = process.env.RELAY_REQUIRE_SIGNED_SESSION_GRANTS === 'true';
+const RELAY_GRANT_MAX_CLOCK_SKEW_MS = Number(process.env.RELAY_GRANT_MAX_CLOCK_SKEW_MS ?? 30_000);
 
 const tunnelsByServerId = new Map<string, TunnelConnection>();
 const tunnelsByConnectionId = new Map<string, TunnelConnection>();
@@ -208,6 +231,195 @@ function getBearerToken(req: { headers: Record<string, string | string[] | undef
   const value = Array.isArray(authorization) ? authorization[0] : authorization;
   if (!value?.startsWith('Bearer ')) return null;
   return value.slice(7).trim();
+}
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+  return new Uint8Array(Buffer.from(value, 'base64url'));
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === 'string');
+}
+
+function isRelayGrant(value: unknown): value is RelayGrant {
+  if (!value || typeof value !== 'object') return false;
+  const grant = value as Record<string, unknown>;
+  return typeof grant.version === 'string'
+    && typeof grant.grantId === 'string'
+    && typeof grant.serverId === 'string'
+    && typeof grant.ownerAccountId === 'string'
+    && typeof grant.subjectAccountId === 'string'
+    && typeof grant.audience === 'string'
+    && ['remote_http', 'remote_ws', 'diagnostic'].includes(String(grant.purpose))
+    && isStringArray(grant.scope)
+    && typeof grant.issuedAt === 'string'
+    && typeof grant.expiresAt === 'string'
+    && typeof grant.sessionLimit === 'number'
+    && typeof grant.entitlementLeaseId === 'string'
+    && typeof grant.issuer === 'string'
+    && typeof grant.keyId === 'string'
+    && grant.signatureAlgorithm === 'ed25519'
+    && typeof grant.signature === 'string';
+}
+
+function parseSignedRelayGrantToken(token: string): RelayGrant | null {
+  if (!token.startsWith('olrg_')) return null;
+  try {
+    const decoded = new TextDecoder().decode(base64UrlToBytes(token.slice('olrg_'.length)));
+    const parsed = JSON.parse(decoded) as unknown;
+    return isRelayGrant(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function importRelayGrantPublicKey(): Promise<CryptoKey | null> {
+  if (!RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL) return null;
+  return crypto.subtle.importKey(
+    'spki',
+    base64UrlToBytes(RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL),
+    'Ed25519',
+    false,
+    ['verify'],
+  );
+}
+
+async function verifyRelayGrantToken(token: string): Promise<{
+  ok: true;
+  grant?: RelayGrant;
+} | {
+  ok: false;
+  condition: RelayConditionResult;
+}> {
+  if (!token.startsWith('olrg_')) {
+    if (!RELAY_REQUIRE_SIGNED_SESSION_GRANTS) {
+      return { ok: true };
+    }
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Signed relay session grant is required',
+      },
+    };
+  }
+
+  const grant = parseSignedRelayGrantToken(token);
+  if (!grant) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Invalid relay grant format',
+      },
+    };
+  }
+
+  const issuedAt = Date.parse(grant.issuedAt);
+  const expiresAt = Date.parse(grant.expiresAt);
+  const now = Date.now();
+  if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Invalid relay grant timestamps',
+      },
+    };
+  }
+  if (expiresAt <= now) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'expired',
+        reasonCode: 'token_expired',
+        detail: 'Relay grant has expired',
+      },
+    };
+  }
+  if (issuedAt - now > RELAY_GRANT_MAX_CLOCK_SKEW_MS) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant is not valid yet',
+      },
+    };
+  }
+  if (grant.audience !== RELAY_GRANT_AUDIENCE) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant audience mismatch',
+      },
+    };
+  }
+  if (grant.sessionLimit < 1 || !grant.scope.includes('relay:session:connect')) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant scope does not allow session attachment',
+      },
+    };
+  }
+
+  const publicKey = await importRelayGrantPublicKey();
+  if (!publicKey) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant verification key is not configured',
+      },
+    };
+  }
+
+  const { signature, ...payload } = grant;
+  const signatureValid = await crypto.subtle.verify(
+    'Ed25519',
+    publicKey,
+    base64UrlToBytes(signature),
+    new TextEncoder().encode(stableStringify(payload)),
+  );
+
+  if (!signatureValid) {
+    relayWarn('relay grant signature rejected', {
+      grantId: grant.grantId,
+      serverId: grant.serverId,
+      audience: grant.audience,
+      keyId: grant.keyId,
+    });
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant signature is invalid',
+      },
+    };
+  }
+
+  return { ok: true, grant };
 }
 
 function parseJson(raw: RawData): JsonRecord | null {
@@ -487,6 +699,14 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
 
 async function attachClientSession(clientSocket: WebSocket, token: string) {
   const connectionId = crypto.randomUUID();
+  const grantVerification = await verifyRelayGrantToken(token);
+  if (!grantVerification.ok) {
+    relayWarn('relay client session grant rejected',
+      addConditionMetadata(grantVerification.condition, {}));
+    clientSocket.close(4401, toCloseReason(grantVerification.condition, 'Invalid relay grant'));
+    return;
+  }
+
   const response = await postControlPlane<{
     sessionId: string;
     serverId: string;
@@ -510,6 +730,27 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
       }));
     clientSocket.close(4401, toCloseReason(consumeCondition, 'Invalid relay session'));
     return;
+  }
+
+  if (grantVerification.grant) {
+    const grant = grantVerification.grant;
+    if (response.data.serverId !== grant.serverId || response.data.userId !== grant.subjectAccountId) {
+      const condition: RelayConditionResult = {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant does not match consumed session',
+      };
+      relayWarn('relay client session grant binding rejected',
+        addConditionMetadata(condition, {
+          grantId: grant.grantId,
+          grantServerId: grant.serverId,
+          sessionServerId: response.data.serverId,
+          grantSubjectAccountId: grant.subjectAccountId,
+          sessionUserId: response.data.userId,
+        }));
+      clientSocket.close(4401, toCloseReason(condition, condition.detail));
+      return;
+    }
   }
 
   const tunnel = tunnelsByServerId.get(response.data.serverId);

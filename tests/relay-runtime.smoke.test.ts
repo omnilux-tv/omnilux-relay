@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { generateKeyPairSync, randomUUID, sign } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -21,10 +21,78 @@ type RelaySessionRecord = {
   metadata?: Record<string, unknown>;
 };
 
+type RelayGrantPayload = {
+  version: string;
+  grantId: string;
+  serverId: string;
+  ownerAccountId: string;
+  subjectAccountId: string;
+  audience: string;
+  purpose: 'remote_http' | 'remote_ws' | 'diagnostic';
+  scope: string[];
+  issuedAt: string;
+  expiresAt: string;
+  sessionLimit: number;
+  entitlementLeaseId: string;
+  issuer: string;
+  keyId: string;
+  signatureAlgorithm: 'ed25519';
+};
+
+const relayGrantKeys = generateKeyPairSync('ed25519');
+const relayGrantPublicKeySpki = Buffer.from(relayGrantKeys.publicKey.export({
+  type: 'spki',
+  format: 'der',
+})).toString('base64url');
+
 const controlPlaneState = {
   registerCalls: [] as Array<{ token: string; body: Record<string, unknown> }>,
   heartbeatCalls: [] as Array<{ token: string; body: Record<string, unknown> }>,
+  consumeCalls: [] as Array<{ token: string; body: Record<string, unknown> }>,
   sessionsByToken: new Map<string, RelaySessionRecord>(),
+};
+
+const stableStringify = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+};
+
+const createSignedRelayGrantToken = (input: {
+  serverId: string;
+  subjectAccountId?: string;
+  issuedAt?: Date;
+  expiresAt?: Date;
+  audience?: string;
+}) => {
+  const issuedAt = input.issuedAt ?? new Date();
+  const expiresAt = input.expiresAt ?? new Date(issuedAt.getTime() + 5 * 60 * 1000);
+  const payload: RelayGrantPayload = {
+    version: '2026-05-10',
+    grantId: `rg_${randomUUID()}`,
+    serverId: input.serverId,
+    ownerAccountId: 'owner-123',
+    subjectAccountId: input.subjectAccountId ?? 'user-123',
+    audience: input.audience ?? 'relay.omnilux.tv',
+    purpose: 'remote_ws',
+    scope: ['relay:session:connect'],
+    issuedAt: issuedAt.toISOString(),
+    expiresAt: expiresAt.toISOString(),
+    sessionLimit: 1,
+    entitlementLeaseId: 'lease-test',
+    issuer: 'api.omnilux.tv',
+    keyId: 'test-key',
+    signatureAlgorithm: 'ed25519',
+  };
+  const signature = sign(null, Buffer.from(stableStringify(payload)), relayGrantKeys.privateKey)
+    .toString('base64url');
+  const grant = { ...payload, signature };
+  return `olrg_${Buffer.from(stableStringify(grant)).toString('base64url')}`;
 };
 
 const getBearerToken = (req: IncomingMessage): string | null => {
@@ -158,6 +226,7 @@ before(async () => {
     }
 
     if (url.pathname === '/functions/v1/consume-relay-session') {
+      controlPlaneState.consumeCalls.push({ token, body });
       const session = controlPlaneState.sessionsByToken.get(token);
       if (!session) {
         json(res, 401, { error: 'Invalid relay session token' });
@@ -185,6 +254,7 @@ before(async () => {
       RELAY_PORT: String(relayPort),
       RELAY_CONTROL_URL: `${controlPlaneOrigin}/functions/v1`,
       RELAY_HEARTBEAT_INTERVAL_MS: '1000',
+      RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL: relayGrantPublicKeySpki,
     },
     stdio: 'pipe',
   });
@@ -198,12 +268,14 @@ before(async () => {
 beforeEach(() => {
   controlPlaneState.registerCalls.length = 0;
   controlPlaneState.heartbeatCalls.length = 0;
+  controlPlaneState.consumeCalls.length = 0;
   controlPlaneState.sessionsByToken.clear();
 });
 
 afterEach(() => {
   controlPlaneState.registerCalls.length = 0;
   controlPlaneState.heartbeatCalls.length = 0;
+  controlPlaneState.consumeCalls.length = 0;
   controlPlaneState.sessionsByToken.clear();
 });
 
@@ -335,6 +407,63 @@ test('session websockets attach to an active tunnel and forward frames both dire
   assert.equal(tunnelCloseMessage.reasonCode, 'client_socket_error');
 
   await closeSocket(tunnelSocket);
+});
+
+test('session websocket verifies a signed relay grant before attaching', async () => {
+  const token = createSignedRelayGrantToken({ serverId: 'server-signed-session' });
+  controlPlaneState.sessionsByToken.set(token, {
+    sessionId: 'session-signed',
+    serverId: 'server-signed-session',
+    userId: 'user-123',
+    sessionType: 'remote-access',
+    metadata: { signed: true },
+  });
+
+  const { socket: tunnelSocket } = await connectServerTunnel('server-token:server-signed-session');
+  const sessionSocket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  await once(sessionSocket, 'open');
+  const tunnelOpen = await nextJsonMessage(tunnelSocket);
+  assert.deepEqual(tunnelOpen, {
+    type: 'session-open',
+    sessionId: 'session-signed',
+    sessionType: 'remote-access',
+    metadata: { signed: true },
+  });
+
+  const sessionReady = await nextJsonMessage(sessionSocket);
+  assert.deepEqual(sessionReady, {
+    type: 'session-ready',
+    sessionId: 'session-signed',
+    serverId: 'server-signed-session',
+  });
+  assert.equal(controlPlaneState.consumeCalls.length, 1);
+
+  await closeSocket(sessionSocket);
+  await closeSocket(tunnelSocket);
+});
+
+test('session websocket rejects expired signed grants before control-plane consumption', async () => {
+  const issuedAt = new Date(Date.now() - 10 * 60 * 1000);
+  const token = createSignedRelayGrantToken({
+    serverId: 'server-expired-grant',
+    issuedAt,
+    expiresAt: new Date(Date.now() - 1000),
+  });
+  const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const closeEvent = await nextCloseEvent(socket);
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay grant has expired/);
+  assert.equal(controlPlaneState.consumeCalls.length, 0);
 });
 
 test('session websocket fails with not-found semantics when the control plane resolves a missing tunnel', async () => {

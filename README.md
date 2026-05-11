@@ -46,6 +46,11 @@ pnpm build
 - `RELAY_PORT` defaults to `8090`
 - `RELAY_CONTROL_URL` defaults to `https://api.omnilux.tv/functions/v1`
 - `relay.omnilux.tv` is the public ingress owned by `omnilux-edge`
+- `RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL` enables local verification for signed
+  `olrg_` relay grants issued by `omnilux-cloud`
+- `RELAY_GRANT_AUDIENCE` defaults to `relay.omnilux.tv`
+- `RELAY_REQUIRE_SIGNED_SESSION_GRANTS=true` rejects legacy opaque `olrs_`
+  session tokens after migration is complete
 
 The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
 
