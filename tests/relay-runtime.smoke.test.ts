@@ -6,6 +6,19 @@ import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import WebSocket from 'ws';
 
+const RELAY_GRANT_TOKEN_PREFIX = 'olrg_';
+
+const stableStringify = (value: unknown): string => {
+  if (value === null || typeof value !== 'object') {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
+  }
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+};
+
 const relayPort = 18090 + Math.floor(Math.random() * 1000);
 const relayOrigin = `http://127.0.0.1:${relayPort}`;
 
@@ -52,17 +65,6 @@ const controlPlaneState = {
   sessionsByToken: new Map<string, RelaySessionRecord>(),
 };
 
-const stableStringify = (value: unknown): string => {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
-};
-
 const createSignedRelayGrantToken = (input: {
   serverId: string;
   subjectAccountId?: string;
@@ -92,7 +94,7 @@ const createSignedRelayGrantToken = (input: {
   const signature = sign(null, Buffer.from(stableStringify(payload)), relayGrantKeys.privateKey)
     .toString('base64url');
   const grant = { ...payload, signature };
-  return `olrg_${Buffer.from(stableStringify(grant)).toString('base64url')}`;
+  return `${RELAY_GRANT_TOKEN_PREFIX}${Buffer.from(stableStringify(grant)).toString('base64url')}`;
 };
 
 const getBearerToken = (req: IncomingMessage): string | null => {
@@ -296,10 +298,12 @@ after(async () => {
   });
 });
 
-test('health endpoint reports relay availability', async () => {
-  const response = await fetch(`${relayOrigin}/healthz`);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { ok: true });
+test('health endpoints report relay availability', async () => {
+  for (const path of ['/health', '/healthz']) {
+    const response = await fetch(`${relayOrigin}${path}`);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { ok: true });
+  }
 });
 
 test('server tunnel websocket rejects unauthenticated clients', async () => {

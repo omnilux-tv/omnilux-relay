@@ -49,16 +49,6 @@ interface TunnelConnection {
   sessions: Set<string>;
 }
 
-interface RelaySession {
-  sessionId: string;
-  serverId: string;
-  userId?: string;
-  sessionType: string;
-  clientSocket: WebSocket;
-  tunnelConnectionId: string;
-  openedAt: string;
-}
-
 interface RelayGrant {
   version: string;
   grantId: string;
@@ -76,6 +66,18 @@ interface RelayGrant {
   keyId: string;
   signatureAlgorithm: 'ed25519';
   signature: string;
+}
+
+const RELAY_GRANT_TOKEN_PREFIX = 'olrg_';
+
+interface RelaySession {
+  sessionId: string;
+  serverId: string;
+  userId?: string;
+  sessionType: string;
+  clientSocket: WebSocket;
+  tunnelConnectionId: string;
+  openedAt: string;
 }
 
 const relayLog = (message: string, data?: JsonRecord) => {
@@ -274,9 +276,9 @@ function isRelayGrant(value: unknown): value is RelayGrant {
 }
 
 function parseSignedRelayGrantToken(token: string): RelayGrant | null {
-  if (!token.startsWith('olrg_')) return null;
+  if (!token.startsWith(RELAY_GRANT_TOKEN_PREFIX)) return null;
   try {
-    const decoded = new TextDecoder().decode(base64UrlToBytes(token.slice('olrg_'.length)));
+    const decoded = new TextDecoder().decode(base64UrlToBytes(token.slice(RELAY_GRANT_TOKEN_PREFIX.length)));
     const parsed = JSON.parse(decoded) as unknown;
     return isRelayGrant(parsed) ? parsed : null;
   } catch {
@@ -302,7 +304,7 @@ async function verifyRelayGrantToken(token: string): Promise<{
   ok: false;
   condition: RelayConditionResult;
 }> {
-  if (!token.startsWith('olrg_')) {
+  if (!token.startsWith(RELAY_GRANT_TOKEN_PREFIX)) {
     if (!RELAY_REQUIRE_SIGNED_SESSION_GRANTS) {
       return { ok: true };
     }
@@ -854,7 +856,7 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '1mb' }));
 
-app.get('/healthz', (_req, res) => {
+app.get(['/health', '/healthz'], (_req, res) => {
   res.json({ ok: true });
 });
 
