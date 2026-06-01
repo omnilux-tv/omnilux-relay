@@ -373,7 +373,17 @@ async function verifyRelayGrantToken(token: string): Promise<{
       },
     };
   }
-  if (grant.sessionLimit < 1 || !grant.scope.includes('relay:session:connect')) {
+  if (grant.sessionLimit !== 1) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant session limit must be exactly one',
+      },
+    };
+  }
+  if (!grant.scope.includes('relay:session:connect')) {
     return {
       ok: false,
       condition: {

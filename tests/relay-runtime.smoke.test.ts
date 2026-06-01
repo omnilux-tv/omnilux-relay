@@ -71,6 +71,7 @@ const createSignedRelayGrantToken = (input: {
   issuedAt?: Date;
   expiresAt?: Date;
   audience?: string;
+  sessionLimit?: number;
 }) => {
   const issuedAt = input.issuedAt ?? new Date();
   const expiresAt = input.expiresAt ?? new Date(issuedAt.getTime() + 5 * 60 * 1000);
@@ -85,7 +86,7 @@ const createSignedRelayGrantToken = (input: {
     scope: ['relay:session:connect'],
     issuedAt: issuedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
-    sessionLimit: 1,
+    sessionLimit: input.sessionLimit ?? 1,
     entitlementLeaseId: 'lease-test',
     issuer: 'api.omnilux.tv',
     keyId: 'test-key',
@@ -467,6 +468,23 @@ test('session websocket rejects expired signed grants before control-plane consu
   const closeEvent = await nextCloseEvent(socket);
   assert.equal(closeEvent.code, 4401);
   assert.match(closeEvent.reason.toString('utf8'), /Relay grant has expired/);
+  assert.equal(controlPlaneState.consumeCalls.length, 0);
+});
+
+test('session websocket rejects signed grants with more than one session before control-plane consumption', async () => {
+  const token = createSignedRelayGrantToken({
+    serverId: 'server-multi-session-grant',
+    sessionLimit: 2,
+  });
+  const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const closeEvent = await nextCloseEvent(socket);
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay grant session limit must be exactly one/);
   assert.equal(controlPlaneState.consumeCalls.length, 0);
 });
 
