@@ -452,6 +452,44 @@ test('session websocket verifies a signed relay grant before attaching', async (
   await closeSocket(tunnelSocket);
 });
 
+test('session websocket rejects signed grants for the wrong audience before control-plane consumption', async () => {
+  const token = createSignedRelayGrantToken({
+    serverId: 'server-wrong-audience-grant',
+    audience: 'wrong-relay.omnilux.tv',
+  });
+  const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const closeEvent = await nextCloseEvent(socket);
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay grant audience mismatch/);
+  assert.equal(controlPlaneState.consumeCalls.length, 0);
+});
+
+test('session websocket rejects signed grants whose consumed session binding does not match', async () => {
+  const token = createSignedRelayGrantToken({ serverId: 'server-bound-in-grant' });
+  controlPlaneState.sessionsByToken.set(token, {
+    sessionId: 'session-binding-mismatch',
+    serverId: 'server-returned-by-control-plane',
+    userId: 'user-123',
+    sessionType: 'remote-access',
+  });
+
+  const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const closeEvent = await nextCloseEvent(socket);
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay grant does not match consumed session/);
+  assert.equal(controlPlaneState.consumeCalls.length, 1);
+});
+
 test('session websocket rejects expired signed grants before control-plane consumption', async () => {
   const issuedAt = new Date(Date.now() - 10 * 60 * 1000);
   const token = createSignedRelayGrantToken({
