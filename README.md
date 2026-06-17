@@ -14,6 +14,7 @@ This repo owns the remote-access transport layer only:
 
 - server tunnel registration
 - session attachment and frame forwarding
+- browser HTTP relay handoff at `/r/<relay-session-token>/`
 - relay heartbeat handling
 - health checks for public edge
 
@@ -51,8 +52,30 @@ pnpm build
 - `RELAY_GRANT_AUDIENCE` defaults to `relay.omnilux.tv`
 - `RELAY_REQUIRE_SIGNED_SESSION_GRANTS=true` rejects legacy opaque `olrs_`
   session tokens after migration is complete
+- `RELAY_HTTP_SESSION_COOKIE` defaults to `omnilux_relay_session`
+- `RELAY_HTTP_SESSION_TTL_MS` defaults to four hours
+- `RELAY_HTTP_REQUEST_TIMEOUT_MS` defaults to ten minutes
+- `RELAY_HTTP_REQUEST_BODY_MAX_BYTES` defaults to 25 MiB
 
 The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
+
+## Browser HTTP relay
+
+The hosted app opens browser remote access by creating a cloud relay session and
+navigating the user to:
+
+```text
+https://relay.omnilux.tv/r/<relay-session-token>/
+```
+
+The relay consumes the short-lived cloud token, binds the browser to an internal
+HTTP-only session cookie, and redirects to `/`. Subsequent browser requests to
+`relay.omnilux.tv` are framed over the live server tunnel as `http-request`
+messages. The self-hosted runtime responds with streamed
+`http-response-start`, `http-response-body`, and `http-response-end` frames.
+This keeps the cloud token out of asset URLs after the initial handoff and lets
+normal absolute runtime paths such as `/assets/...` and `/api/...` work through
+the relay origin.
 
 ## Relay health contract
 

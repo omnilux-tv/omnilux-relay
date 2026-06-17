@@ -250,7 +250,7 @@ before(async () => {
   }
   controlPlaneOrigin = `http://127.0.0.1:${address.port}`;
 
-  relayProcess = spawn('pnpm', ['exec', 'tsx', 'src/index.ts'], {
+  relayProcess = spawn(process.execPath, ['--import', 'tsx', 'src/index.ts'], {
     cwd: process.cwd(),
     env: {
       ...process.env,
@@ -449,6 +449,90 @@ test('session websocket verifies a signed relay grant before attaching', async (
   assert.equal(controlPlaneState.consumeCalls.length, 1);
 
   await closeSocket(sessionSocket);
+  await closeSocket(tunnelSocket);
+});
+
+test('browser HTTP relay handoff proxies requests over an active tunnel', async () => {
+  const token = createSignedRelayGrantToken({ serverId: 'server-http-relay' });
+  controlPlaneState.sessionsByToken.set(token, {
+    sessionId: 'session-http',
+    serverId: 'server-http-relay',
+    userId: 'user-123',
+    sessionType: 'remote-access',
+    metadata: { surface: 'browser' },
+  });
+
+  const { socket: tunnelSocket } = await connectServerTunnel('server-token:server-http-relay');
+  const sessionOpenPromise = nextJsonMessage(tunnelSocket);
+  const handoffResponse = await fetch(`${relayOrigin}/r/${encodeURIComponent(token)}/library?view=recent`, {
+    redirect: 'manual',
+  });
+  assert.equal(handoffResponse.status, 302);
+  assert.equal(handoffResponse.headers.get('location'), '/library?view=recent');
+  const relayCookie = handoffResponse.headers.get('set-cookie')?.split(';')[0];
+  assert.match(relayCookie ?? '', /^omnilux_relay_session=/);
+
+  const sessionOpen = await sessionOpenPromise;
+  assert.deepEqual(sessionOpen, {
+    type: 'session-open',
+    sessionId: 'session-http',
+    sessionType: 'remote-access',
+    metadata: { surface: 'browser' },
+  });
+
+  const requestFramePromise = nextJsonMessage(tunnelSocket);
+  const proxiedResponsePromise = fetch(`${relayOrigin}/api/health`, {
+    headers: {
+      cookie: relayCookie ?? '',
+      range: 'bytes=0-4',
+    },
+  });
+
+  const requestFrame = await requestFramePromise;
+  assert.equal(requestFrame.type, 'session-frame');
+  assert.equal(requestFrame.sessionId, 'session-http');
+  assert.equal(requestFrame.encoding, 'text');
+  const requestEnvelope = JSON.parse(String(requestFrame.data)) as {
+    type: string;
+    requestId: string;
+    method: string;
+    path: string;
+    headers: Array<[string, string]>;
+  };
+  assert.equal(requestEnvelope.type, 'http-request');
+  assert.equal(requestEnvelope.method, 'GET');
+  assert.equal(requestEnvelope.path, '/api/health');
+  assert.ok(requestEnvelope.headers.some(([name, value]) => name === 'range' && value === 'bytes=0-4'));
+
+  tunnelSocket.send(JSON.stringify({
+    type: 'http-response-start',
+    sessionId: 'session-http',
+    requestId: requestEnvelope.requestId,
+    status: 206,
+    statusText: 'Partial Content',
+    headers: [
+      ['content-type', 'application/json'],
+      ['content-range', 'bytes 0-4/11'],
+    ],
+  }));
+  tunnelSocket.send(JSON.stringify({
+    type: 'http-response-body',
+    sessionId: 'session-http',
+    requestId: requestEnvelope.requestId,
+    encoding: 'base64',
+    data: Buffer.from('hello').toString('base64'),
+  }));
+  tunnelSocket.send(JSON.stringify({
+    type: 'http-response-end',
+    sessionId: 'session-http',
+    requestId: requestEnvelope.requestId,
+  }));
+
+  const proxiedResponse = await proxiedResponsePromise;
+  assert.equal(proxiedResponse.status, 206);
+  assert.equal(proxiedResponse.headers.get('content-range'), 'bytes 0-4/11');
+  assert.equal(await proxiedResponse.text(), 'hello');
+
   await closeSocket(tunnelSocket);
 });
 
