@@ -63,6 +63,7 @@ const controlPlaneState = {
   heartbeatCalls: [] as Array<{ token: string; body: Record<string, unknown> }>,
   consumeCalls: [] as Array<{ token: string; body: Record<string, unknown> }>,
   sessionsByToken: new Map<string, RelaySessionRecord>(),
+  terminalSessionsById: new Map<string, string>(),
 };
 
 const createSignedRelayGrantToken = (input: {
@@ -71,6 +72,7 @@ const createSignedRelayGrantToken = (input: {
   issuedAt?: Date;
   expiresAt?: Date;
   audience?: string;
+  purpose?: RelayGrantPayload['purpose'];
   sessionLimit?: number;
 }) => {
   const issuedAt = input.issuedAt ?? new Date();
@@ -82,7 +84,7 @@ const createSignedRelayGrantToken = (input: {
     ownerAccountId: 'owner-123',
     subjectAccountId: input.subjectAccountId ?? 'user-123',
     audience: input.audience ?? 'relay.omnilux.tv',
-    purpose: 'remote_ws',
+    purpose: input.purpose ?? 'remote_ws',
     scope: ['relay:session:connect'],
     issuedAt: issuedAt.toISOString(),
     expiresAt: expiresAt.toISOString(),
@@ -224,7 +226,17 @@ before(async () => {
         return;
       }
 
-      json(res, 200, { ok: true });
+      const sessionIds = Array.isArray(body.sessionIds)
+        ? body.sessionIds.filter((sessionId): sessionId is string => typeof sessionId === 'string')
+        : [];
+      const terminalSessions = sessionIds
+        .filter((sessionId) => controlPlaneState.terminalSessionsById.has(sessionId))
+        .map((sessionId) => ({
+          sessionId,
+          status: controlPlaneState.terminalSessionsById.get(sessionId) ?? 'revoked',
+        }));
+
+      json(res, 200, { ok: true, terminalSessions });
       return;
     }
 
@@ -273,6 +285,7 @@ beforeEach(() => {
   controlPlaneState.heartbeatCalls.length = 0;
   controlPlaneState.consumeCalls.length = 0;
   controlPlaneState.sessionsByToken.clear();
+  controlPlaneState.terminalSessionsById.clear();
 });
 
 afterEach(() => {
@@ -280,6 +293,7 @@ afterEach(() => {
   controlPlaneState.heartbeatCalls.length = 0;
   controlPlaneState.consumeCalls.length = 0;
   controlPlaneState.sessionsByToken.clear();
+  controlPlaneState.terminalSessionsById.clear();
 });
 
 after(async () => {
@@ -452,8 +466,46 @@ test('session websocket verifies a signed relay grant before attaching', async (
   await closeSocket(tunnelSocket);
 });
 
+test('session websocket closes when heartbeat reports the consumed session was revoked', async () => {
+  const token = createSignedRelayGrantToken({ serverId: 'server-revoked-session' });
+  controlPlaneState.sessionsByToken.set(token, {
+    sessionId: 'session-revoked',
+    serverId: 'server-revoked-session',
+    userId: 'user-123',
+    sessionType: 'remote-access',
+    metadata: { signed: true },
+  });
+
+  const { socket: tunnelSocket } = await connectServerTunnel('server-token:server-revoked-session');
+  const sessionSocket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  await once(sessionSocket, 'open');
+  await nextJsonMessage(tunnelSocket);
+  await nextJsonMessage(sessionSocket);
+
+  controlPlaneState.terminalSessionsById.set('session-revoked', 'revoked');
+  const closeEventPromise = nextCloseEvent(sessionSocket);
+  tunnelSocket.send(JSON.stringify({ type: 'heartbeat' }));
+
+  const sessionClose = await nextJsonMessage(tunnelSocket);
+  assert.equal(sessionClose.type, 'session-close');
+  assert.equal(sessionClose.sessionId, 'session-revoked');
+  assert.equal(sessionClose.relayCondition, 'revoked');
+  assert.equal(sessionClose.reasonCode, 'token_revoked');
+
+  const closeEvent = await closeEventPromise;
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay session revoked/);
+
+  await closeSocket(tunnelSocket);
+});
+
 test('browser HTTP relay handoff proxies requests over an active tunnel', async () => {
-  const token = createSignedRelayGrantToken({ serverId: 'server-http-relay' });
+  const token = createSignedRelayGrantToken({ serverId: 'server-http-relay', purpose: 'remote_http' });
   controlPlaneState.sessionsByToken.set(token, {
     sessionId: 'session-http',
     serverId: 'server-http-relay',
@@ -590,6 +642,25 @@ test('session websocket rejects expired signed grants before control-plane consu
   const closeEvent = await nextCloseEvent(socket);
   assert.equal(closeEvent.code, 4401);
   assert.match(closeEvent.reason.toString('utf8'), /Relay grant has expired/);
+  assert.equal(controlPlaneState.consumeCalls.length, 0);
+});
+
+test('session websocket rejects signed grants with an excessive TTL before control-plane consumption', async () => {
+  const issuedAt = new Date();
+  const token = createSignedRelayGrantToken({
+    serverId: 'server-long-ttl-grant',
+    issuedAt,
+    expiresAt: new Date(issuedAt.getTime() + 10 * 60 * 1000),
+  });
+  const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  const closeEvent = await nextCloseEvent(socket);
+  assert.equal(closeEvent.code, 4401);
+  assert.match(closeEvent.reason.toString('utf8'), /Relay grant TTL exceeds maximum/);
   assert.equal(controlPlaneState.consumeCalls.length, 0);
 });
 

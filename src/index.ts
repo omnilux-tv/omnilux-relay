@@ -78,6 +78,8 @@ interface RelaySession {
   clientSocket: WebSocket;
   tunnelConnectionId: string;
   openedAt: string;
+  expiresAt: number;
+  expiryTimer?: NodeJS.Timeout;
 }
 
 interface PendingHttpRelayRequest {
@@ -97,6 +99,10 @@ interface HttpRelaySession {
   lastSeenAt: string;
   expiresAt: number;
   pendingRequests: Map<string, PendingHttpRelayRequest>;
+}
+
+function isTerminalRelayCondition(condition: RelayCondition): boolean {
+  return condition === 'unauthorized' || condition === 'expired' || condition === 'revoked';
 }
 
 const relayLog = (message: string, data?: JsonRecord) => {
@@ -135,6 +141,7 @@ const RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL = process.env.RELAY_GRANT_PUBLIC_KEY_SP
 const RELAY_GRANT_AUDIENCE = process.env.RELAY_GRANT_AUDIENCE?.trim() || 'relay.omnilux.tv';
 const RELAY_REQUIRE_SIGNED_SESSION_GRANTS = process.env.RELAY_REQUIRE_SIGNED_SESSION_GRANTS === 'true';
 const RELAY_GRANT_MAX_CLOCK_SKEW_MS = Number(process.env.RELAY_GRANT_MAX_CLOCK_SKEW_MS ?? 30_000);
+const RELAY_GRANT_MAX_TTL_MS = Number(process.env.RELAY_GRANT_MAX_TTL_MS ?? 5 * 60 * 1000);
 const RELAY_HTTP_SESSION_COOKIE = process.env.RELAY_HTTP_SESSION_COOKIE?.trim() || 'omnilux_relay_session';
 const RELAY_HTTP_SESSION_TTL_MS = Number(process.env.RELAY_HTTP_SESSION_TTL_MS ?? 4 * 60 * 60 * 1000);
 const RELAY_HTTP_REQUEST_TIMEOUT_MS = Number(process.env.RELAY_HTTP_REQUEST_TIMEOUT_MS ?? 10 * 60 * 1000);
@@ -391,6 +398,16 @@ async function verifyRelayGrantToken(token: string): Promise<{
       },
     };
   }
+  if (expiresAt - issuedAt > RELAY_GRANT_MAX_TTL_MS) {
+    return {
+      ok: false,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay grant TTL exceeds maximum',
+      },
+    };
+  }
   if (issuedAt - now > RELAY_GRANT_MAX_CLOCK_SKEW_MS) {
     return {
       ok: false,
@@ -618,10 +635,16 @@ function closeHttpRelaySession(session: HttpRelaySession, reason = 'Relay HTTP s
   }
 
   if (tunnel?.socket.readyState === WebSocket.OPEN) {
+    const condition = classifyRelayCondition({
+      source: reason.toLowerCase().includes('expired') ? 'session-attach' : 'close',
+      closeReason: reason,
+    });
     sendJson(tunnel.socket, {
       type: 'session-close',
       sessionId: session.sessionId,
       reason,
+      relayCondition: condition.relayCondition,
+      reasonCode: condition.reasonCode,
     });
   }
 }
@@ -640,6 +663,9 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
   if (!grantVerification.ok) {
     throw new Error(grantVerification.condition.detail);
   }
+  if (grantVerification.grant && grantVerification.grant.purpose !== 'remote_http') {
+    throw new Error('Relay grant purpose is not valid for HTTP relay');
+  }
 
   const connectionId = crypto.randomUUID();
   const response = await postControlPlane<{
@@ -647,6 +673,7 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
     serverId: string;
     userId?: string;
     sessionType: string;
+    expiresAt?: string;
     metadata?: Record<string, unknown>;
   }>('consume-relay-session', token, { connectionId });
 
@@ -667,6 +694,8 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
   }
 
   const handle = crypto.randomUUID();
+  const cloudExpiresAt = response.data.expiresAt ? Date.parse(response.data.expiresAt) : NaN;
+  const localExpiresAt = Date.now() + RELAY_HTTP_SESSION_TTL_MS;
   const session: HttpRelaySession = {
     handle,
     sessionId: response.data.sessionId,
@@ -676,7 +705,7 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
     tunnelConnectionId: tunnel.connectionId,
     openedAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
-    expiresAt: Date.now() + RELAY_HTTP_SESSION_TTL_MS,
+    expiresAt: Number.isFinite(cloudExpiresAt) ? Math.min(localExpiresAt, cloudExpiresAt) : localExpiresAt,
     pendingRequests: new Map(),
   };
 
@@ -773,33 +802,66 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
   }
 }
 
-function handleHttpResponseStart(payload: JsonRecord) {
+function getOwnedHttpRelaySession(payload: JsonRecord, tunnel: TunnelConnection): HttpRelaySession | null {
+  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
+  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  if (!session) return null;
+  if (session.tunnelConnectionId !== tunnel.connectionId) {
+    relayWarn('relay rejected cross-tunnel http frame', {
+      sessionId,
+      expectedConnectionId: session.tunnelConnectionId,
+      actualConnectionId: tunnel.connectionId,
+      serverId: tunnel.serverId,
+    });
+    return null;
+  }
+  return session;
+}
+
+function handleHttpResponseStart(payload: JsonRecord, tunnel: TunnelConnection) {
   const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
-  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  const session = getOwnedHttpRelaySession(payload, tunnel);
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!session || !pending || pending.response.headersSent) return;
 
-  const status = typeof payload.status === 'number' ? payload.status : 502;
+  const status = typeof payload.status === 'number' && Number.isInteger(payload.status) && payload.status >= 100 && payload.status <= 599
+    ? payload.status
+    : 502;
   const headers = sanitizeOutgoingHeaders(payload.headers);
   pending.response.status(status);
   pending.response.setHeader('Cache-Control', 'private, no-store');
 
-  for (const [name, values] of headers) {
-    if (name === 'set-cookie') {
-      pending.response.setHeader('Set-Cookie', values);
-    } else {
-      pending.response.setHeader(name, values.length === 1 ? values[0] : values);
+  try {
+    for (const [name, values] of headers) {
+      if (name === 'set-cookie') {
+        pending.response.setHeader('Set-Cookie', values);
+      } else {
+        pending.response.setHeader(name, values.length === 1 ? values[0] : values);
+      }
     }
+  } catch (error) {
+    relayWarn('relay rejected malformed http response headers', {
+      sessionId,
+      requestId,
+      error: error instanceof Error ? error.message : 'Unknown header error',
+    });
+    if (!pending.response.headersSent) {
+      pending.response.status(502).json({ error: 'Relay server response headers were invalid' });
+    }
+    if (requestId) {
+      session.pendingRequests.delete(requestId);
+    }
+    clearTimeout(pending.timeout);
+    return;
   }
 
   pending.started = true;
 }
 
-function handleHttpResponseBody(payload: JsonRecord) {
-  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
+function handleHttpResponseBody(payload: JsonRecord, tunnel: TunnelConnection) {
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
-  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  const session = getOwnedHttpRelaySession(payload, tunnel);
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!pending || pending.response.writableEnded) return;
 
@@ -808,10 +870,9 @@ function handleHttpResponseBody(payload: JsonRecord) {
   pending.response.write(chunk);
 }
 
-function handleHttpResponseEnd(payload: JsonRecord) {
-  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
+function handleHttpResponseEnd(payload: JsonRecord, tunnel: TunnelConnection) {
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
-  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  const session = getOwnedHttpRelaySession(payload, tunnel);
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!session || !requestId || !pending) return;
 
@@ -820,10 +881,9 @@ function handleHttpResponseEnd(payload: JsonRecord) {
   if (!pending.response.writableEnded) pending.response.end();
 }
 
-function handleHttpResponseError(payload: JsonRecord) {
-  const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
+function handleHttpResponseError(payload: JsonRecord, tunnel: TunnelConnection) {
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
-  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  const session = getOwnedHttpRelaySession(payload, tunnel);
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!session || !requestId || !pending) return;
 
@@ -851,6 +911,7 @@ function closeSession(
   if (!session) return;
 
   sessionsById.delete(sessionId);
+  if (session.expiryTimer) clearTimeout(session.expiryTimer);
   const tunnel = tunnelsByConnectionId.get(session.tunnelConnectionId);
   tunnel?.sessions.delete(sessionId);
 
@@ -1038,8 +1099,15 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
     detail: 'heartbeat ok',
   };
 
-  const response = await postControlPlane<{ ok: boolean }>('relay-heartbeat', tunnel.token, {
+  const response = await postControlPlane<{
+    ok: boolean;
+    terminalSessions?: Array<{
+      sessionId: string;
+      status: string;
+    }>;
+  }>('relay-heartbeat', tunnel.token, {
     connectionId: tunnel.connectionId,
+    sessionIds: Array.from(tunnel.sessions),
     relayStatus: relayStatusForControlPlane(outgoingCondition.relayCondition),
     relayCondition: outgoingCondition.relayCondition,
     reasonCode: outgoingCondition.reasonCode,
@@ -1054,6 +1122,36 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
     return handleRelayHeartbeatFailure(tunnel, response);
   }
 
+  for (const terminalSession of response.data?.terminalSessions ?? []) {
+    const sessionId = typeof terminalSession.sessionId === 'string' ? terminalSession.sessionId : '';
+    const status = typeof terminalSession.status === 'string' ? terminalSession.status : 'revoked';
+    if (!sessionId || !tunnel.sessions.has(sessionId)) {
+      continue;
+    }
+
+    const condition: RelayConditionResult = status === 'expired'
+      ? {
+          relayCondition: 'expired',
+          reasonCode: 'token_expired',
+          detail: 'Relay session expired',
+        }
+      : {
+          relayCondition: 'revoked',
+          reasonCode: 'token_revoked',
+          detail: 'Relay session revoked',
+        };
+    const wsSession = sessionsById.get(sessionId);
+    if (wsSession?.tunnelConnectionId === tunnel.connectionId) {
+      closeSession(sessionId, 4401, condition.detail, condition);
+      continue;
+    }
+
+    const httpSession = httpSessionsById.get(sessionId);
+    if (httpSession?.tunnelConnectionId === tunnel.connectionId) {
+      closeHttpRelaySession(httpSession, condition.detail);
+    }
+  }
+
   return outgoingCondition;
 }
 
@@ -1066,12 +1164,27 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
     clientSocket.close(4401, toCloseReason(grantVerification.condition, 'Invalid relay grant'));
     return;
   }
+  if (grantVerification.grant && grantVerification.grant.purpose !== 'remote_ws') {
+    const condition: RelayConditionResult = {
+      relayCondition: 'unauthorized',
+      reasonCode: 'auth_invalid',
+      detail: 'Relay grant purpose is not valid for WebSocket relay',
+    };
+    relayWarn('relay client session grant purpose rejected',
+      addConditionMetadata(condition, {
+        grantId: grantVerification.grant.grantId,
+        purpose: grantVerification.grant.purpose,
+      }));
+    clientSocket.close(4401, toCloseReason(condition, condition.detail));
+    return;
+  }
 
   const response = await postControlPlane<{
     sessionId: string;
     serverId: string;
     userId?: string;
     sessionType: string;
+    expiresAt?: string;
     metadata?: Record<string, unknown>;
   }>('consume-relay-session', token, { connectionId });
 
@@ -1128,6 +1241,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
     return;
   }
 
+  const cloudExpiresAt = response.data.expiresAt ? Date.parse(response.data.expiresAt) : NaN;
   const session: RelaySession = {
     sessionId: response.data.sessionId,
     serverId: response.data.serverId,
@@ -1136,7 +1250,16 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
     clientSocket,
     tunnelConnectionId: tunnel.connectionId,
     openedAt: new Date().toISOString(),
+    expiresAt: Number.isFinite(cloudExpiresAt) ? cloudExpiresAt : Date.now() + RELAY_HTTP_SESSION_TTL_MS,
   };
+  session.expiryTimer = setTimeout(() => {
+    const condition: RelayConditionResult = {
+      relayCondition: 'expired',
+      reasonCode: 'token_expired',
+      detail: 'Relay session expired',
+    };
+    closeSession(session.sessionId, 4401, condition.detail, condition);
+  }, Math.max(1, session.expiresAt - Date.now()));
 
   sessionsById.set(session.sessionId, session);
   tunnel.sessions.add(session.sessionId);
@@ -1290,6 +1413,12 @@ tunnelWss.on('connection', (socket, req) => {
           connectionId: tunnel.connectionId,
         }),
       );
+      if (isTerminalRelayCondition(condition.relayCondition)) {
+        dropTunnel(tunnel.connectionId, condition);
+        if (tunnel.socket.readyState === WebSocket.OPEN || tunnel.socket.readyState === WebSocket.CONNECTING) {
+          tunnel.socket.close(4401, toCloseReason(condition, 'Relay tunnel authorization ended'));
+        }
+      }
     }
   }, RELAY_HEARTBEAT_INTERVAL_MS);
 
@@ -1328,12 +1457,25 @@ tunnelWss.on('connection', (socket, req) => {
           relayCondition: condition.relayCondition,
           reasonCode: condition.reasonCode,
         });
+        if (isTerminalRelayCondition(condition.relayCondition)) {
+          dropTunnel(tunnel.connectionId, condition);
+          socket.close(4401, toCloseReason(condition, 'Relay tunnel authorization ended'));
+        }
         break;
       }
       case 'session-frame': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
         const session = sessionId ? sessionsById.get(sessionId) : null;
         if (!session) return;
+        if (session.tunnelConnectionId !== tunnel.connectionId) {
+          relayWarn('relay rejected cross-tunnel session frame', {
+            sessionId,
+            expectedConnectionId: session.tunnelConnectionId,
+            actualConnectionId: tunnel.connectionId,
+            serverId: tunnel.serverId,
+          });
+          return;
+        }
         if (session.clientSocket.readyState !== WebSocket.OPEN) {
           const condition: RelayConditionResult = {
             relayCondition: 'degraded',
@@ -1358,10 +1500,29 @@ tunnelWss.on('connection', (socket, req) => {
         if (!sessionId) break;
         const httpSession = httpSessionsById.get(sessionId);
         if (httpSession) {
+          if (httpSession.tunnelConnectionId !== tunnel.connectionId) {
+            relayWarn('relay rejected cross-tunnel http session close', {
+              sessionId,
+              expectedConnectionId: httpSession.tunnelConnectionId,
+              actualConnectionId: tunnel.connectionId,
+              serverId: tunnel.serverId,
+            });
+            break;
+          }
           closeHttpRelaySession(
             httpSession,
             typeof payload.reason === 'string' ? payload.reason : 'Session closed by server',
           );
+          break;
+        }
+        const session = sessionsById.get(sessionId);
+        if (session && session.tunnelConnectionId !== tunnel.connectionId) {
+          relayWarn('relay rejected cross-tunnel session close', {
+            sessionId,
+            expectedConnectionId: session.tunnelConnectionId,
+            actualConnectionId: tunnel.connectionId,
+            serverId: tunnel.serverId,
+          });
           break;
         }
         const condition: RelayConditionResult = {
@@ -1373,16 +1534,16 @@ tunnelWss.on('connection', (socket, req) => {
         break;
       }
       case 'http-response-start':
-        handleHttpResponseStart(payload);
+        handleHttpResponseStart(payload, tunnel);
         break;
       case 'http-response-body':
-        handleHttpResponseBody(payload);
+        handleHttpResponseBody(payload, tunnel);
         break;
       case 'http-response-end':
-        handleHttpResponseEnd(payload);
+        handleHttpResponseEnd(payload, tunnel);
         break;
       case 'http-response-error':
-        handleHttpResponseError(payload);
+        handleHttpResponseError(payload, tunnel);
         break;
       default:
         sendJson(socket, {
