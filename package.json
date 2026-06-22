@@ -12,9 +12,10 @@
     "build": "tsc -p tsconfig.json",
     "lint": "tsc -p tsconfig.json --noEmit",
     "start": "node dist/index.js",
-    "test:smoke": "node --test --import tsx tests/relay-runtime.smoke.test.ts"
+    "test:smoke": "node --test --import tsx tests/*.test.ts"
   },
   "dependencies": {
+    "@omnilux/api-contracts": "workspace:*",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "ws": "^8.18.3"

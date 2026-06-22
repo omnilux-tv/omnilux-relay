@@ -8,6 +8,9 @@ importers:
 
   .:
     dependencies:
+      '@omnilux/api-contracts':
+        specifier: workspace:*
+        version: link:../omnilux-packages/packages/api-contracts
       dotenv:
         specifier: ^16.4.7
         version: 16.6.1
@@ -32,6 +35,22 @@ importers:
         version: 4.21.0
       typescript:
         specifier: ^5.8.2
+        version: 5.9.3
+
+  ../omnilux-packages/packages/api-contracts:
+    dependencies:
+      '@omnilux/types':
+        specifier: workspace:*
+        version: link:../types
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
+  ../omnilux-packages/packages/types:
+    devDependencies:
+      typescript:
+        specifier: ^5.9.3
         version: 5.9.3
 
 packages:

@@ -4,20 +4,8 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { after, afterEach, before, beforeEach, test } from 'node:test';
 import assert from 'node:assert/strict';
+import { RELAY_GRANT_TOKEN_PREFIX, stableStringify } from '@omnilux/api-contracts';
 import WebSocket from 'ws';
-
-const RELAY_GRANT_TOKEN_PREFIX = 'olrg_';
-
-const stableStringify = (value: unknown): string => {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
-};
 
 const relayPort = 18090 + Math.floor(Math.random() * 1000);
 const relayOrigin = `http://127.0.0.1:${relayPort}`;
@@ -35,7 +23,8 @@ type RelaySessionRecord = {
 };
 
 type RelayGrantPayload = {
-  version: string;
+  contractName: 'relay-grant';
+  contractVersion: 1;
   grantId: string;
   serverId: string;
   ownerAccountId: string;
@@ -78,7 +67,8 @@ const createSignedRelayGrantToken = (input: {
   const issuedAt = input.issuedAt ?? new Date();
   const expiresAt = input.expiresAt ?? new Date(issuedAt.getTime() + 5 * 60 * 1000);
   const payload: RelayGrantPayload = {
-    version: '2026-05-10',
+    contractName: 'relay-grant',
+    contractVersion: 1,
     grantId: `rg_${randomUUID()}`,
     serverId: input.serverId,
     ownerAccountId: 'owner-123',

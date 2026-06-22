@@ -3,72 +3,38 @@ import crypto from 'node:crypto';
 import { createServer } from 'node:http';
 import express, { type Request, type Response } from 'express';
 import WebSocket, { WebSocketServer, type RawData } from 'ws';
-
-type JsonRecord = Record<string, unknown>;
-
-type RelayCondition = 'connected' | 'degraded' | 'unauthorized' | 'expired' | 'revoked' | 'unreachable';
-type RelayReasonCode =
-  | 'ok'
-  | 'auth_invalid'
-  | 'token_expired'
-  | 'token_revoked'
-  | 'control_plane_unreachable'
-  | 'control_plane_error'
-  | 'tunnel_missing'
-  | 'session_attach_error'
-  | 'client_socket_error'
-  | 'frame_forwarding_error'
-  | 'socket_error'
-  | 'invalid_register_payload';
-
-interface RelayConditionResult {
-  relayCondition: RelayCondition;
-  reasonCode: RelayReasonCode;
-  detail: string;
-}
-
-interface RelayConditionEvidence {
-  source: 'register' | 'heartbeat' | 'session-attach' | 'close' | 'socket-error';
-  status?: number;
-  error?: string;
-  closeReason?: string;
-  hasActiveTunnel?: boolean;
-  code?: number;
-}
-
-interface TunnelConnection {
-  serverId: string;
-  connectionId: string;
-  token: string;
-  socket: WebSocket;
-  registeredAt: string;
-  protocolVersion: number;
-  region?: string;
-  clientVersion?: string;
-  capabilities?: Record<string, unknown>;
-  sessions: Set<string>;
-}
-
-interface RelayGrant {
-  version: string;
-  grantId: string;
-  serverId: string;
-  ownerAccountId: string;
-  subjectAccountId: string;
-  audience: string;
-  purpose: 'remote_http' | 'remote_ws' | 'diagnostic';
-  scope: string[];
-  issuedAt: string;
-  expiresAt: string;
-  sessionLimit: number;
-  entitlementLeaseId: string;
-  issuer: string;
-  keyId: string;
-  signatureAlgorithm: 'ed25519';
-  signature: string;
-}
-
-const RELAY_GRANT_TOKEN_PREFIX = 'olrg_';
+import {
+  addConditionMetadata,
+  classifyRelayCondition,
+  isTerminalRelayCondition,
+  relayStatusForControlPlane,
+  toCloseReason,
+  type JsonRecord,
+  type RelayConditionResult,
+} from './relay-condition.js';
+import {
+  parseSignedRelayGrantToken,
+  verifyRelayGrantToken as verifyRelayGrantTokenWithPolicy,
+  type RelayGrant,
+} from './relay-grant-verification.js';
+import { createRelayControlPlaneClient } from './relay-control-plane.js';
+import {
+  closePendingHttpRelayRequests,
+  endPendingHttpRelayRequest,
+  failPendingHttpRelayRequest,
+  openPendingHttpRelayRequest,
+  readRelayHttpRequestBody,
+  removePendingHttpRelayRequest,
+  sanitizeRelayIncomingHeaders,
+  startRelayHttpResponse,
+  writeRelayHttpResponseBody,
+  type PendingHttpRelayRequest,
+} from './relay-http-stream.js';
+import { attachRelaySession } from './relay-session-attachment.js';
+import {
+  createRelayTunnelRegistry,
+  type TunnelConnection,
+} from './relay-tunnel-registry.js';
 
 interface RelaySession {
   sessionId: string;
@@ -82,12 +48,6 @@ interface RelaySession {
   expiryTimer?: NodeJS.Timeout;
 }
 
-interface PendingHttpRelayRequest {
-  response: Response;
-  timeout: NodeJS.Timeout;
-  started: boolean;
-}
-
 interface HttpRelaySession {
   handle: string;
   sessionId: string;
@@ -99,10 +59,6 @@ interface HttpRelaySession {
   lastSeenAt: string;
   expiresAt: number;
   pendingRequests: Map<string, PendingHttpRelayRequest>;
-}
-
-function isTerminalRelayCondition(condition: RelayCondition): boolean {
-  return condition === 'unauthorized' || condition === 'expired' || condition === 'revoked';
 }
 
 const relayLog = (message: string, data?: JsonRecord) => {
@@ -147,199 +103,19 @@ const RELAY_HTTP_SESSION_TTL_MS = Number(process.env.RELAY_HTTP_SESSION_TTL_MS ?
 const RELAY_HTTP_REQUEST_TIMEOUT_MS = Number(process.env.RELAY_HTTP_REQUEST_TIMEOUT_MS ?? 10 * 60 * 1000);
 const RELAY_HTTP_REQUEST_BODY_MAX_BYTES = Number(process.env.RELAY_HTTP_REQUEST_BODY_MAX_BYTES ?? 25 * 1024 * 1024);
 
-const HOP_BY_HOP_HEADERS = new Set([
-  'connection',
-  'keep-alive',
-  'proxy-authenticate',
-  'proxy-authorization',
-  'te',
-  'trailer',
-  'transfer-encoding',
-  'upgrade',
-  'host',
-  'content-length',
-]);
-
-const tunnelsByServerId = new Map<string, TunnelConnection>();
-const tunnelsByConnectionId = new Map<string, TunnelConnection>();
+const tunnelRegistry = createRelayTunnelRegistry();
 const sessionsById = new Map<string, RelaySession>();
 const httpSessionsByHandle = new Map<string, HttpRelaySession>();
 const httpSessionsById = new Map<string, HttpRelaySession>();
-
-function normalizeLower(value: string | undefined): string {
-  return (value ?? '').toLowerCase();
-}
-
-function hasAny(value: string, terms: readonly string[]): boolean {
-  return terms.some((term) => value.includes(term));
-}
-
-function classifyRelayCondition(evidence: RelayConditionEvidence): RelayConditionResult {
-  const status = evidence.status;
-  const lowerError = normalizeLower(evidence.error);
-  const lowerReason = normalizeLower(evidence.closeReason);
-
-  const revokedTerms = ['revoked', 'token revoked', 'credential revoked', 'revocation', 'invalidated'];
-  const expiredTerms = ['expired', 'expiry', 'token expired', 'session expired', 'jwt expired'];
-  const authTerms = ['unauthorized', 'forbidden', 'invalid bearer', 'invalid token', 'missing token', 'authentication', 'auth'];
-  const unreachableTerms = ['failed to fetch', 'fetch', 'timeout', 'econnrefused', 'network', 'enotfound', 'dns'];
-
-  const message = `${lowerError} ${lowerReason}`;
-
-  if (evidence.hasActiveTunnel === false) {
-    return {
-      relayCondition: 'unreachable',
-      reasonCode: 'tunnel_missing',
-      detail: evidence.error ?? evidence.closeReason ?? 'No active relay tunnel for this server',
-    };
-  }
-
-  if (hasAny(message, revokedTerms)) {
-    return {
-      relayCondition: 'revoked',
-      reasonCode: 'token_revoked',
-      detail: evidence.error ?? evidence.closeReason ?? 'credential revoked',
-    };
-  }
-
-  if (hasAny(message, expiredTerms)) {
-    return {
-      relayCondition: 'expired',
-      reasonCode: 'token_expired',
-      detail: evidence.error ?? evidence.closeReason ?? 'token expired',
-    };
-  }
-
-  if (status === 401 || status === 403 || hasAny(message, authTerms)) {
-    return {
-      relayCondition: 'unauthorized',
-      reasonCode: 'auth_invalid',
-      detail: evidence.error ?? evidence.closeReason ?? 'authentication/authorization rejected',
-    };
-  }
-
-  if (status === 410 || status === 419) {
-    return {
-      relayCondition: 'expired',
-      reasonCode: 'token_expired',
-      detail: evidence.error ?? 'token/session expired',
-    };
-  }
-
-  if (evidence.source === 'socket-error' || evidence.source === 'close') {
-    return {
-      relayCondition: 'degraded',
-      reasonCode: 'socket_error',
-      detail: evidence.error ?? evidence.closeReason ?? 'transport/socket error',
-    };
-  }
-
-  if ((status !== undefined && status >= 500) || status === 0 || hasAny(message, unreachableTerms)) {
-    return {
-      relayCondition: 'unreachable',
-      reasonCode: 'control_plane_unreachable',
-      detail: evidence.error ?? evidence.closeReason ?? 'control plane unreachable',
-    };
-  }
-
-  if (status !== undefined) {
-    return {
-      relayCondition: 'degraded',
-      reasonCode: status >= 400 ? 'control_plane_error' : 'ok',
-      detail: evidence.error ?? 'control-plane returned non-success',
-    };
-  }
-
-  return {
-    relayCondition: 'connected',
-    reasonCode: 'ok',
-    detail: 'ok',
-  };
-}
-
-function relayStatusForControlPlane(condition: RelayCondition): string {
-  return condition === 'connected' ? 'online' : 'degraded';
-}
-
-function toCloseReason(condition: RelayConditionResult, fallback: string): string {
-  return `Relay condition ${condition.relayCondition} (${condition.reasonCode}): ${condition.detail}`;
-}
-
-function addConditionMetadata(condition: RelayConditionResult, extra: JsonRecord): JsonRecord {
-  return {
-    relayCondition: condition.relayCondition,
-    reasonCode: condition.reasonCode,
-    ...extra,
-  };
-}
+const relayControlPlane = createRelayControlPlaneClient({
+  baseUrl: RELAY_CONTROL_URL,
+});
 
 function getBearerToken(req: { headers: Record<string, string | string[] | undefined> }): string | null {
   const authorization = req.headers.authorization;
   const value = Array.isArray(authorization) ? authorization[0] : authorization;
   if (!value?.startsWith('Bearer ')) return null;
   return value.slice(7).trim();
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== 'object') {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map((item) => stableStringify(item)).join(',')}]`;
-  }
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
-}
-
-function base64UrlToBytes(value: string): Uint8Array {
-  return new Uint8Array(Buffer.from(value, 'base64url'));
-}
-
-function isStringArray(value: unknown): value is string[] {
-  return Array.isArray(value) && value.every((item) => typeof item === 'string');
-}
-
-function isRelayGrant(value: unknown): value is RelayGrant {
-  if (!value || typeof value !== 'object') return false;
-  const grant = value as Record<string, unknown>;
-  return typeof grant.version === 'string'
-    && typeof grant.grantId === 'string'
-    && typeof grant.serverId === 'string'
-    && typeof grant.ownerAccountId === 'string'
-    && typeof grant.subjectAccountId === 'string'
-    && typeof grant.audience === 'string'
-    && ['remote_http', 'remote_ws', 'diagnostic'].includes(String(grant.purpose))
-    && isStringArray(grant.scope)
-    && typeof grant.issuedAt === 'string'
-    && typeof grant.expiresAt === 'string'
-    && typeof grant.sessionLimit === 'number'
-    && typeof grant.entitlementLeaseId === 'string'
-    && typeof grant.issuer === 'string'
-    && typeof grant.keyId === 'string'
-    && grant.signatureAlgorithm === 'ed25519'
-    && typeof grant.signature === 'string';
-}
-
-function parseSignedRelayGrantToken(token: string): RelayGrant | null {
-  if (!token.startsWith(RELAY_GRANT_TOKEN_PREFIX)) return null;
-  try {
-    const decoded = new TextDecoder().decode(base64UrlToBytes(token.slice(RELAY_GRANT_TOKEN_PREFIX.length)));
-    const parsed = JSON.parse(decoded) as unknown;
-    return isRelayGrant(parsed) ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-async function importRelayGrantPublicKey(): Promise<CryptoKey | null> {
-  if (!RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL) return null;
-  return crypto.subtle.importKey(
-    'spki',
-    base64UrlToBytes(RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL),
-    'Ed25519',
-    false,
-    ['verify'],
-  );
 }
 
 async function verifyRelayGrantToken(token: string): Promise<{
@@ -349,144 +125,25 @@ async function verifyRelayGrantToken(token: string): Promise<{
   ok: false;
   condition: RelayConditionResult;
 }> {
-  if (!token.startsWith(RELAY_GRANT_TOKEN_PREFIX)) {
-    if (!RELAY_REQUIRE_SIGNED_SESSION_GRANTS) {
-      return { ok: true };
-    }
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Signed relay session grant is required',
-      },
-    };
-  }
+  const result = await verifyRelayGrantTokenWithPolicy(token, {
+    requireSignedSessionGrants: RELAY_REQUIRE_SIGNED_SESSION_GRANTS,
+    publicKeySpkiBase64Url: RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL,
+    audience: RELAY_GRANT_AUDIENCE,
+    maxClockSkewMs: RELAY_GRANT_MAX_CLOCK_SKEW_MS,
+    maxTtlMs: RELAY_GRANT_MAX_TTL_MS,
+  });
 
-  const grant = parseSignedRelayGrantToken(token);
-  if (!grant) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Invalid relay grant format',
-      },
-    };
-  }
-
-  const issuedAt = Date.parse(grant.issuedAt);
-  const expiresAt = Date.parse(grant.expiresAt);
-  const now = Date.now();
-  if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt)) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Invalid relay grant timestamps',
-      },
-    };
-  }
-  if (expiresAt <= now) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'expired',
-        reasonCode: 'token_expired',
-        detail: 'Relay grant has expired',
-      },
-    };
-  }
-  if (expiresAt - issuedAt > RELAY_GRANT_MAX_TTL_MS) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant TTL exceeds maximum',
-      },
-    };
-  }
-  if (issuedAt - now > RELAY_GRANT_MAX_CLOCK_SKEW_MS) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant is not valid yet',
-      },
-    };
-  }
-  if (grant.audience !== RELAY_GRANT_AUDIENCE) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant audience mismatch',
-      },
-    };
-  }
-  if (grant.sessionLimit !== 1) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant session limit must be exactly one',
-      },
-    };
-  }
-  if (!grant.scope.includes('relay:session:connect')) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant scope does not allow session attachment',
-      },
-    };
-  }
-
-  const publicKey = await importRelayGrantPublicKey();
-  if (!publicKey) {
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant verification key is not configured',
-      },
-    };
-  }
-
-  const { signature, ...payload } = grant;
-  const signatureValid = await crypto.subtle.verify(
-    'Ed25519',
-    publicKey,
-    base64UrlToBytes(signature),
-    new TextEncoder().encode(stableStringify(payload)),
-  );
-
-  if (!signatureValid) {
+  if (!result.ok && result.condition.detail === 'Relay grant signature is invalid') {
+    const grant = parseSignedRelayGrantToken(token);
     relayWarn('relay grant signature rejected', {
-      grantId: grant.grantId,
-      serverId: grant.serverId,
-      audience: grant.audience,
-      keyId: grant.keyId,
+      grantId: grant?.grantId,
+      serverId: grant?.serverId,
+      audience: grant?.audience,
+      keyId: grant?.keyId,
     });
-    return {
-      ok: false,
-      condition: {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant signature is invalid',
-      },
-    };
   }
 
-  return { ok: true, grant };
+  return result;
 }
 
 function parseJson(raw: RawData): JsonRecord | null {
@@ -511,37 +168,6 @@ function rawDataToBuffer(raw: RawData): Buffer {
 
 function rawChunkToBuffer(raw: ArrayBuffer | Buffer): Buffer {
   return raw instanceof ArrayBuffer ? Buffer.from(new Uint8Array(raw)) : Buffer.from(raw);
-}
-
-async function postControlPlane<T>(
-  path: string,
-  token: string,
-  body: JsonRecord,
-): Promise<{ ok: boolean; status: number; data?: T; error?: string }> {
-  try {
-    const response = await fetch(`${RELAY_CONTROL_URL}/${path}`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(10_000),
-    });
-
-    const text = await response.text();
-    const data = text ? JSON.parse(text) as T : undefined;
-
-    return response.ok
-      ? { ok: true, status: response.status, data }
-      : { ok: false, status: response.status, error: (data as { error?: string } | undefined)?.error ?? text };
-  } catch (error) {
-    return {
-      ok: false,
-      status: 0,
-      error: error instanceof Error ? error.message : 'Unknown relay control-plane error',
-    };
-  }
 }
 
 function sendJson(socket: WebSocket, payload: JsonRecord) {
@@ -569,70 +195,13 @@ function clearRelaySessionCookie(): string {
   return `${RELAY_HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`;
 }
 
-function sanitizeIncomingHeaders(headers: Request['headers']): Array<[string, string]> {
-  const pairs: Array<[string, string]> = [];
-  for (const [name, value] of Object.entries(headers)) {
-    const lower = name.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower) || lower.startsWith('sec-websocket-')) continue;
-    if (Array.isArray(value)) {
-      for (const item of value) pairs.push([name, item]);
-    } else if (typeof value === 'string') {
-      pairs.push([name, value]);
-    }
-  }
-  return pairs;
-}
-
-function sanitizeOutgoingHeaders(headers: unknown): Map<string, string[]> {
-  const normalized = new Map<string, string[]>();
-  if (!Array.isArray(headers)) return normalized;
-
-  for (const pair of headers) {
-    if (!Array.isArray(pair) || pair.length !== 2) continue;
-    const [name, value] = pair;
-    if (typeof name !== 'string' || typeof value !== 'string') continue;
-    const lower = name.toLowerCase();
-    if (HOP_BY_HOP_HEADERS.has(lower)) continue;
-    const existing = normalized.get(lower) ?? [];
-    existing.push(value);
-    normalized.set(lower, existing);
-  }
-
-  return normalized;
-}
-
-async function readRequestBody(req: Request): Promise<Buffer | undefined> {
-  if (req.method === 'GET' || req.method === 'HEAD') return undefined;
-  const chunks: Buffer[] = [];
-  let total = 0;
-
-  for await (const chunk of req) {
-    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-    total += buffer.byteLength;
-    if (total > RELAY_HTTP_REQUEST_BODY_MAX_BYTES) {
-      throw new Error('Relay HTTP request body is too large');
-    }
-    chunks.push(buffer);
-  }
-
-  return chunks.length > 0 ? Buffer.concat(chunks) : undefined;
-}
-
 function closeHttpRelaySession(session: HttpRelaySession, reason = 'Relay HTTP session closed') {
   httpSessionsByHandle.delete(session.handle);
   httpSessionsById.delete(session.sessionId);
-  const tunnel = tunnelsByConnectionId.get(session.tunnelConnectionId);
-  tunnel?.sessions.delete(session.sessionId);
+  const tunnel = tunnelRegistry.getByConnectionId(session.tunnelConnectionId);
+  tunnelRegistry.removeSession(session.tunnelConnectionId, session.sessionId);
 
-  for (const [requestId, pending] of session.pendingRequests) {
-    clearTimeout(pending.timeout);
-    if (!pending.response.headersSent) {
-      pending.response.status(502).json({ error: reason });
-    } else if (!pending.response.writableEnded) {
-      pending.response.end();
-    }
-    session.pendingRequests.delete(requestId);
-  }
+  closePendingHttpRelayRequests(session, reason);
 
   if (tunnel?.socket.readyState === WebSocket.OPEN) {
     const condition = classifyRelayCondition({
@@ -659,49 +228,28 @@ function closeExpiredHttpRelaySessions() {
 }
 
 async function createHttpRelaySession(token: string): Promise<HttpRelaySession> {
-  const grantVerification = await verifyRelayGrantToken(token);
-  if (!grantVerification.ok) {
-    throw new Error(grantVerification.condition.detail);
-  }
-  if (grantVerification.grant && grantVerification.grant.purpose !== 'remote_http') {
-    throw new Error('Relay grant purpose is not valid for HTTP relay');
-  }
-
-  const connectionId = crypto.randomUUID();
-  const response = await postControlPlane<{
-    sessionId: string;
-    serverId: string;
-    userId?: string;
-    sessionType: string;
-    expiresAt?: string;
-    metadata?: Record<string, unknown>;
-  }>('consume-relay-session', token, { connectionId });
-
-  if (!response.ok || !response.data) {
-    throw new Error(response.error ?? 'Invalid relay session');
+  const attachment = await attachRelaySession({
+    token,
+    purpose: 'remote_http',
+    relayControlPlane,
+    tunnelRegistry,
+    verifyGrantToken: verifyRelayGrantToken,
+  });
+  if (!attachment.ok) {
+    throw new Error(attachment.condition.detail);
   }
 
-  if (grantVerification.grant) {
-    const grant = grantVerification.grant;
-    if (response.data.serverId !== grant.serverId || response.data.userId !== grant.subjectAccountId) {
-      throw new Error('Relay grant does not match consumed session');
-    }
-  }
-
-  const tunnel = tunnelsByServerId.get(response.data.serverId);
-  if (!tunnel) {
-    throw new Error('No active relay tunnel for this server');
-  }
-
+  const consumedSession = attachment.consumedSession;
+  const tunnel = attachment.tunnel;
   const handle = crypto.randomUUID();
-  const cloudExpiresAt = response.data.expiresAt ? Date.parse(response.data.expiresAt) : NaN;
+  const cloudExpiresAt = consumedSession.expiresAt ? Date.parse(consumedSession.expiresAt) : NaN;
   const localExpiresAt = Date.now() + RELAY_HTTP_SESSION_TTL_MS;
   const session: HttpRelaySession = {
     handle,
-    sessionId: response.data.sessionId,
-    serverId: response.data.serverId,
-    userId: response.data.userId,
-    sessionType: response.data.sessionType,
+    sessionId: consumedSession.sessionId,
+    serverId: consumedSession.serverId,
+    userId: consumedSession.userId,
+    sessionType: consumedSession.sessionType,
     tunnelConnectionId: tunnel.connectionId,
     openedAt: new Date().toISOString(),
     lastSeenAt: new Date().toISOString(),
@@ -711,13 +259,13 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
 
   httpSessionsByHandle.set(handle, session);
   httpSessionsById.set(session.sessionId, session);
-  tunnel.sessions.add(session.sessionId);
+  tunnelRegistry.addSession(tunnel.connectionId, session.sessionId);
 
   sendJson(tunnel.socket, {
     type: 'session-open',
     sessionId: session.sessionId,
     sessionType: session.sessionType,
-    metadata: response.data.metadata ?? {},
+    metadata: consumedSession.metadata ?? {},
   });
 
   relayLog('relay http session opened', {
@@ -743,7 +291,7 @@ function findHttpSessionFromRequest(req: Request): HttpRelaySession | null {
 }
 
 async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, res: Response) {
-  const tunnel = tunnelsByConnectionId.get(session.tunnelConnectionId);
+  const tunnel = tunnelRegistry.getByConnectionId(session.tunnelConnectionId);
   if (!tunnel || tunnel.socket.readyState !== WebSocket.OPEN) {
     closeHttpRelaySession(session, 'Relay tunnel is unavailable');
     res.setHeader('Set-Cookie', clearRelaySessionCookie());
@@ -751,32 +299,13 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
     return;
   }
 
-  const requestId = crypto.randomUUID();
-  const timeout = setTimeout(() => {
-    const pending = session.pendingRequests.get(requestId);
-    if (!pending) return;
-    session.pendingRequests.delete(requestId);
-    if (!pending.response.headersSent) {
-      pending.response.status(504).json({ error: 'Relay HTTP request timed out' });
-    } else if (!pending.response.writableEnded) {
-      pending.response.end();
-    }
-  }, RELAY_HTTP_REQUEST_TIMEOUT_MS);
-
-  session.pendingRequests.set(requestId, {
-    response: res,
-    timeout,
-    started: false,
-  });
-
-  res.on('close', () => {
-    if (res.writableEnded) return;
-    session.pendingRequests.delete(requestId);
-    clearTimeout(timeout);
+  const requestId = openPendingHttpRelayRequest(session, res, {
+    timeoutMs: RELAY_HTTP_REQUEST_TIMEOUT_MS,
+    createRequestId: crypto.randomUUID,
   });
 
   try {
-    const body = await readRequestBody(req);
+    const body = await readRelayHttpRequestBody(req, RELAY_HTTP_REQUEST_BODY_MAX_BYTES);
     sendJson(tunnel.socket, {
       type: 'session-frame',
       sessionId: session.sessionId,
@@ -786,14 +315,13 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
         requestId,
         method: req.method,
         path: req.originalUrl || '/',
-        headers: sanitizeIncomingHeaders(req.headers),
+        headers: sanitizeRelayIncomingHeaders(req.headers),
         bodyEncoding: body ? 'base64' : undefined,
         body: body ? body.toString('base64') : undefined,
       }),
     });
   } catch (error) {
-    session.pendingRequests.delete(requestId);
-    clearTimeout(timeout);
+    removePendingHttpRelayRequest(session, requestId);
     if (!res.headersSent) {
       res.status(413).json({
         error: error instanceof Error ? error.message : 'Relay HTTP request failed',
@@ -823,40 +351,18 @@ function handleHttpResponseStart(payload: JsonRecord, tunnel: TunnelConnection) 
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
   const session = getOwnedHttpRelaySession(payload, tunnel);
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
-  if (!session || !pending || pending.response.headersSent) return;
+  if (!session || !requestId || !pending || pending.response.headersSent) return;
 
-  const status = typeof payload.status === 'number' && Number.isInteger(payload.status) && payload.status >= 100 && payload.status <= 599
-    ? payload.status
-    : 502;
-  const headers = sanitizeOutgoingHeaders(payload.headers);
-  pending.response.status(status);
-  pending.response.setHeader('Cache-Control', 'private, no-store');
-
-  try {
-    for (const [name, values] of headers) {
-      if (name === 'set-cookie') {
-        pending.response.setHeader('Set-Cookie', values);
-      } else {
-        pending.response.setHeader(name, values.length === 1 ? values[0] : values);
-      }
-    }
-  } catch (error) {
+  const result = startRelayHttpResponse(pending, payload);
+  if (!result.ok) {
     relayWarn('relay rejected malformed http response headers', {
       sessionId,
       requestId,
-      error: error instanceof Error ? error.message : 'Unknown header error',
+      error: result.error,
     });
-    if (!pending.response.headersSent) {
-      pending.response.status(502).json({ error: 'Relay server response headers were invalid' });
-    }
-    if (requestId) {
-      session.pendingRequests.delete(requestId);
-    }
-    clearTimeout(pending.timeout);
+    removePendingHttpRelayRequest(session, requestId);
     return;
   }
-
-  pending.started = true;
 }
 
 function handleHttpResponseBody(payload: JsonRecord, tunnel: TunnelConnection) {
@@ -865,36 +371,24 @@ function handleHttpResponseBody(payload: JsonRecord, tunnel: TunnelConnection) {
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!pending || pending.response.writableEnded) return;
 
-  const data = typeof payload.data === 'string' ? payload.data : '';
-  const chunk = payload.encoding === 'base64' ? Buffer.from(data, 'base64') : data;
-  pending.response.write(chunk);
+  writeRelayHttpResponseBody(pending, payload);
 }
 
 function handleHttpResponseEnd(payload: JsonRecord, tunnel: TunnelConnection) {
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
   const session = getOwnedHttpRelaySession(payload, tunnel);
-  const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
-  if (!session || !requestId || !pending) return;
+  if (!session || !requestId) return;
 
-  session.pendingRequests.delete(requestId);
-  clearTimeout(pending.timeout);
-  if (!pending.response.writableEnded) pending.response.end();
+  endPendingHttpRelayRequest(session, requestId);
 }
 
 function handleHttpResponseError(payload: JsonRecord, tunnel: TunnelConnection) {
   const requestId = typeof payload.requestId === 'string' ? payload.requestId : null;
   const session = getOwnedHttpRelaySession(payload, tunnel);
-  const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
-  if (!session || !requestId || !pending) return;
+  if (!session || !requestId) return;
 
-  session.pendingRequests.delete(requestId);
-  clearTimeout(pending.timeout);
   const message = typeof payload.message === 'string' ? payload.message : 'Relay HTTP request failed';
-  if (!pending.response.headersSent) {
-    pending.response.status(502).json({ error: message });
-  } else if (!pending.response.writableEnded) {
-    pending.response.end();
-  }
+  failPendingHttpRelayRequest(session, requestId, message);
 }
 
 function closeSession(
@@ -912,8 +406,8 @@ function closeSession(
 
   sessionsById.delete(sessionId);
   if (session.expiryTimer) clearTimeout(session.expiryTimer);
-  const tunnel = tunnelsByConnectionId.get(session.tunnelConnectionId);
-  tunnel?.sessions.delete(sessionId);
+  const tunnel = tunnelRegistry.getByConnectionId(session.tunnelConnectionId);
+  tunnelRegistry.removeSession(session.tunnelConnectionId, sessionId);
 
   const reason = toCloseReason(condition, fallback);
 
@@ -943,13 +437,10 @@ function closeSession(
 }
 
 function dropTunnel(connectionId: string, condition: RelayConditionResult): void {
-  const tunnel = tunnelsByConnectionId.get(connectionId);
+  const tunnel = tunnelRegistry.getByConnectionId(connectionId);
   if (!tunnel) return;
 
-  tunnelsByConnectionId.delete(connectionId);
-  if (tunnelsByServerId.get(tunnel.serverId)?.connectionId === connectionId) {
-    tunnelsByServerId.delete(tunnel.serverId);
-  }
+  tunnelRegistry.removeByConnectionId(connectionId);
 
   for (const sessionId of Array.from(tunnel.sessions)) {
     closeSession(sessionId, 1011, toCloseReason(condition, 'Relay tunnel dropped'), condition);
@@ -1004,12 +495,7 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
   }
 
   const connectionId = crypto.randomUUID();
-  const response = await postControlPlane<{
-    ok: boolean;
-    serverId: string;
-    heartbeatIntervalSeconds: number;
-    relaySessionTtlSeconds: number;
-  }>('register-relay-connection', token, {
+  const response = await relayControlPlane.registerRelayConnection(token, {
     connectionId,
     protocolVersion,
     region: typeof payload.region === 'string' ? payload.region : undefined,
@@ -1026,7 +512,7 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
         error: response.error,
       });
 
-  if (!response.ok || !response.data) {
+  if (!response.ok) {
     sendJson(socket, {
       type: 'error',
       code: 'REGISTER_FAILED',
@@ -1041,19 +527,6 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
         error: response.error,
       }));
     return;
-  }
-
-  const existing = tunnelsByServerId.get(response.data.serverId);
-  if (existing) {
-    const superseded = {
-      relayCondition: 'degraded' as const,
-      reasonCode: 'control_plane_error' as const,
-      detail: 'Superseded by a newer tunnel',
-    } satisfies RelayConditionResult;
-    dropTunnel(existing.connectionId, superseded);
-    if (existing.socket.readyState === WebSocket.OPEN || existing.socket.readyState === WebSocket.CONNECTING) {
-      existing.socket.close(1012, toCloseReason(superseded, 'Superseded by a newer tunnel'));
-    }
   }
 
   const tunnel: TunnelConnection = {
@@ -1071,8 +544,18 @@ async function registerTunnel(socket: WebSocket, token: string, payload: JsonRec
     sessions: new Set(),
   };
 
-  tunnelsByServerId.set(tunnel.serverId, tunnel);
-  tunnelsByConnectionId.set(connectionId, tunnel);
+  const existing = tunnelRegistry.register(tunnel);
+  if (existing) {
+    const superseded = {
+      relayCondition: 'degraded' as const,
+      reasonCode: 'control_plane_error' as const,
+      detail: 'Superseded by a newer tunnel',
+    } satisfies RelayConditionResult;
+    dropTunnel(existing.connectionId, superseded);
+    if (existing.socket.readyState === WebSocket.OPEN || existing.socket.readyState === WebSocket.CONNECTING) {
+      existing.socket.close(1012, toCloseReason(superseded, 'Superseded by a newer tunnel'));
+    }
+  }
 
   sendJson(socket, {
     type: 'registered',
@@ -1099,13 +582,7 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
     detail: 'heartbeat ok',
   };
 
-  const response = await postControlPlane<{
-    ok: boolean;
-    terminalSessions?: Array<{
-      sessionId: string;
-      status: string;
-    }>;
-  }>('relay-heartbeat', tunnel.token, {
+  const response = await relayControlPlane.recordRelayHeartbeat(tunnel.token, {
     connectionId: tunnel.connectionId,
     sessionIds: Array.from(tunnel.sessions),
     relayStatus: relayStatusForControlPlane(outgoingCondition.relayCondition),
@@ -1156,97 +633,55 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
 }
 
 async function attachClientSession(clientSocket: WebSocket, token: string) {
-  const connectionId = crypto.randomUUID();
-  const grantVerification = await verifyRelayGrantToken(token);
-  if (!grantVerification.ok) {
-    relayWarn('relay client session grant rejected',
-      addConditionMetadata(grantVerification.condition, {}));
-    clientSocket.close(4401, toCloseReason(grantVerification.condition, 'Invalid relay grant'));
-    return;
-  }
-  if (grantVerification.grant && grantVerification.grant.purpose !== 'remote_ws') {
-    const condition: RelayConditionResult = {
-      relayCondition: 'unauthorized',
-      reasonCode: 'auth_invalid',
-      detail: 'Relay grant purpose is not valid for WebSocket relay',
-    };
-    relayWarn('relay client session grant purpose rejected',
-      addConditionMetadata(condition, {
-        grantId: grantVerification.grant.grantId,
-        purpose: grantVerification.grant.purpose,
-      }));
-    clientSocket.close(4401, toCloseReason(condition, condition.detail));
-    return;
-  }
+  const attachment = await attachRelaySession({
+    token,
+    purpose: 'remote_ws',
+    relayControlPlane,
+    tunnelRegistry,
+    verifyGrantToken: verifyRelayGrantToken,
+  });
 
-  const response = await postControlPlane<{
-    sessionId: string;
-    serverId: string;
-    userId?: string;
-    sessionType: string;
-    expiresAt?: string;
-    metadata?: Record<string, unknown>;
-  }>('consume-relay-session', token, { connectionId });
+  if (!attachment.ok) {
+    const logMessage = attachment.stage === 'grant'
+      ? 'relay client session grant rejected'
+      : attachment.stage === 'purpose'
+        ? 'relay client session grant purpose rejected'
+        : attachment.stage === 'binding'
+          ? 'relay client session grant binding rejected'
+          : attachment.stage === 'tunnel'
+            ? 'relay client session attach failed - no tunnel'
+            : 'relay client session attach failed';
 
-  const consumeCondition = response.ok
-    ? { relayCondition: 'connected' as const, reasonCode: 'ok' as const, detail: 'consume ok' } as RelayConditionResult
-    : classifyRelayCondition({
-        source: 'session-attach',
-        status: response.status,
-        error: response.error,
-      });
-
-  if (!response.ok || !response.data) {
-    relayWarn('relay client session attach failed',
-      addConditionMetadata(consumeCondition, {
-        error: response.error,
-      }));
-    clientSocket.close(4401, toCloseReason(consumeCondition, 'Invalid relay session'));
+    relayWarn(
+      logMessage,
+      addConditionMetadata(attachment.condition, {
+        ...(attachment.error ? { error: attachment.error } : {}),
+        ...(attachment.grant ? {
+          grantId: attachment.grant.grantId,
+          grantServerId: attachment.grant.serverId,
+          grantSubjectAccountId: attachment.grant.subjectAccountId,
+          purpose: attachment.grant.purpose,
+        } : {}),
+      }),
+    );
+    clientSocket.close(
+      attachment.stage === 'tunnel' ? 4404 : 4401,
+      toCloseReason(
+        attachment.condition,
+        attachment.stage === 'grant' ? 'Invalid relay grant' : attachment.condition.detail,
+      ),
+    );
     return;
   }
 
-  if (grantVerification.grant) {
-    const grant = grantVerification.grant;
-    if (response.data.serverId !== grant.serverId || response.data.userId !== grant.subjectAccountId) {
-      const condition: RelayConditionResult = {
-        relayCondition: 'unauthorized',
-        reasonCode: 'auth_invalid',
-        detail: 'Relay grant does not match consumed session',
-      };
-      relayWarn('relay client session grant binding rejected',
-        addConditionMetadata(condition, {
-          grantId: grant.grantId,
-          grantServerId: grant.serverId,
-          sessionServerId: response.data.serverId,
-          grantSubjectAccountId: grant.subjectAccountId,
-          sessionUserId: response.data.userId,
-        }));
-      clientSocket.close(4401, toCloseReason(condition, condition.detail));
-      return;
-    }
-  }
-
-  const tunnel = tunnelsByServerId.get(response.data.serverId);
-  if (!tunnel) {
-    const condition: RelayConditionResult = {
-      relayCondition: 'unreachable',
-      reasonCode: 'tunnel_missing',
-      detail: 'No active relay tunnel for this server',
-    };
-    relayWarn('relay client session attach failed - no tunnel',
-      addConditionMetadata(condition, {
-        serverId: response.data.serverId,
-      }));
-    clientSocket.close(4404, toCloseReason(condition, condition.detail));
-    return;
-  }
-
-  const cloudExpiresAt = response.data.expiresAt ? Date.parse(response.data.expiresAt) : NaN;
+  const consumedSession = attachment.consumedSession;
+  const tunnel = attachment.tunnel;
+  const cloudExpiresAt = consumedSession.expiresAt ? Date.parse(consumedSession.expiresAt) : NaN;
   const session: RelaySession = {
-    sessionId: response.data.sessionId,
-    serverId: response.data.serverId,
-    userId: response.data.userId,
-    sessionType: response.data.sessionType,
+    sessionId: consumedSession.sessionId,
+    serverId: consumedSession.serverId,
+    userId: consumedSession.userId,
+    sessionType: consumedSession.sessionType,
     clientSocket,
     tunnelConnectionId: tunnel.connectionId,
     openedAt: new Date().toISOString(),
@@ -1262,13 +697,13 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
   }, Math.max(1, session.expiresAt - Date.now()));
 
   sessionsById.set(session.sessionId, session);
-  tunnel.sessions.add(session.sessionId);
+  tunnelRegistry.addSession(tunnel.connectionId, session.sessionId);
 
   sendJson(tunnel.socket, {
     type: 'session-open',
     sessionId: session.sessionId,
     sessionType: session.sessionType,
-    metadata: response.data.metadata ?? {},
+    metadata: consumedSession.metadata ?? {},
   });
 
   sendJson(clientSocket, {
@@ -1279,7 +714,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
 
   relayLog(
     'relay session attached',
-    addConditionMetadata(consumeCondition, {
+    addConditionMetadata(attachment.condition, {
       serverId: session.serverId,
       sessionId: session.sessionId,
       connectionId: tunnel.connectionId,
@@ -1402,7 +837,7 @@ tunnelWss.on('connection', (socket, req) => {
 
   const heartbeatTimer = setInterval(async () => {
     if (!tunnelConnectionId) return;
-    const tunnel = tunnelsByConnectionId.get(tunnelConnectionId);
+    const tunnel = tunnelRegistry.getByConnectionId(tunnelConnectionId);
     if (!tunnel) return;
     const condition = await handleTunnelHeartbeat(tunnel, {});
     if (condition.relayCondition !== 'connected') {
@@ -1431,7 +866,7 @@ tunnelWss.on('connection', (socket, req) => {
 
     if (payload.type === 'register') {
       await registerTunnel(socket, token, payload);
-      const registered = Array.from(tunnelsByConnectionId.values()).find((candidate) => candidate.socket === socket);
+      const registered = tunnelRegistry.findBySocket(socket);
       tunnelConnectionId = registered?.connectionId ?? null;
       return;
     }
@@ -1441,7 +876,7 @@ tunnelWss.on('connection', (socket, req) => {
       return;
     }
 
-    const tunnel = tunnelsByConnectionId.get(tunnelConnectionId);
+    const tunnel = tunnelRegistry.getByConnectionId(tunnelConnectionId);
     if (!tunnel) {
       sendJson(socket, { type: 'error', code: 'UNKNOWN_TUNNEL', message: 'Relay tunnel is not active' });
       return;

@@ -1,0 +1,3 @@
+packages:
+  - "../omnilux-packages/packages/api-contracts"
+  - "../omnilux-packages/packages/types"
