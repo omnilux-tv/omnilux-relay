@@ -28,8 +28,18 @@ import {
   sanitizeRelayIncomingHeaders,
   startRelayHttpResponse,
   writeRelayHttpResponseBody,
-  type PendingHttpRelayRequest,
 } from './relay-http-stream.js';
+import {
+  clearRelaySessionCookie,
+  closeExpiredHttpRelaySessions as closeExpiredStoredHttpRelaySessions,
+  createHttpRelaySessionRecord,
+  createRelayHttpSessionStore,
+  findHttpRelaySessionFromCookie,
+  relayHandoffRedirectTarget,
+  relaySessionCookie,
+  relaySessionMaxAgeSeconds,
+  type HttpRelaySession,
+} from './relay-http-session.js';
 import { attachRelaySession } from './relay-session-attachment.js';
 import {
   createRelayTunnelRegistry,
@@ -46,19 +56,6 @@ interface RelaySession {
   openedAt: string;
   expiresAt: number;
   expiryTimer?: NodeJS.Timeout;
-}
-
-interface HttpRelaySession {
-  handle: string;
-  sessionId: string;
-  serverId: string;
-  userId?: string;
-  sessionType: string;
-  tunnelConnectionId: string;
-  openedAt: string;
-  lastSeenAt: string;
-  expiresAt: number;
-  pendingRequests: Map<string, PendingHttpRelayRequest>;
 }
 
 const relayLog = (message: string, data?: JsonRecord) => {
@@ -105,8 +102,7 @@ const RELAY_HTTP_REQUEST_BODY_MAX_BYTES = Number(process.env.RELAY_HTTP_REQUEST_
 
 const tunnelRegistry = createRelayTunnelRegistry();
 const sessionsById = new Map<string, RelaySession>();
-const httpSessionsByHandle = new Map<string, HttpRelaySession>();
-const httpSessionsById = new Map<string, HttpRelaySession>();
+const httpSessionStore = createRelayHttpSessionStore();
 const relayControlPlane = createRelayControlPlaneClient({
   baseUrl: RELAY_CONTROL_URL,
 });
@@ -174,30 +170,8 @@ function sendJson(socket: WebSocket, payload: JsonRecord) {
   socket.send(JSON.stringify(payload));
 }
 
-function parseCookies(cookieHeader: string | undefined): Record<string, string> {
-  const cookies: Record<string, string> = {};
-  if (!cookieHeader) return cookies;
-  for (const segment of cookieHeader.split(';')) {
-    const [rawName, ...rawValue] = segment.trim().split('=');
-    if (!rawName || rawValue.length === 0) continue;
-    cookies[rawName] = decodeURIComponent(rawValue.join('='));
-  }
-  return cookies;
-}
-
-function relaySessionCookie(handle: string, maxAgeSeconds: number): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `${RELAY_HTTP_SESSION_COOKIE}=${encodeURIComponent(handle)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${maxAgeSeconds}${secure}`;
-}
-
-function clearRelaySessionCookie(): string {
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `${RELAY_HTTP_SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`;
-}
-
 function closeHttpRelaySession(session: HttpRelaySession, reason = 'Relay HTTP session closed') {
-  httpSessionsByHandle.delete(session.handle);
-  httpSessionsById.delete(session.sessionId);
+  httpSessionStore.remove(session);
   const tunnel = tunnelRegistry.getByConnectionId(session.tunnelConnectionId);
   tunnelRegistry.removeSession(session.tunnelConnectionId, session.sessionId);
 
@@ -219,12 +193,7 @@ function closeHttpRelaySession(session: HttpRelaySession, reason = 'Relay HTTP s
 }
 
 function closeExpiredHttpRelaySessions() {
-  const now = Date.now();
-  for (const session of httpSessionsByHandle.values()) {
-    if (session.expiresAt <= now) {
-      closeHttpRelaySession(session, 'Relay HTTP session expired');
-    }
-  }
+  closeExpiredStoredHttpRelaySessions(httpSessionStore, closeHttpRelaySession);
 }
 
 async function createHttpRelaySession(token: string): Promise<HttpRelaySession> {
@@ -241,24 +210,14 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
 
   const consumedSession = attachment.consumedSession;
   const tunnel = attachment.tunnel;
-  const handle = crypto.randomUUID();
-  const cloudExpiresAt = consumedSession.expiresAt ? Date.parse(consumedSession.expiresAt) : NaN;
-  const localExpiresAt = Date.now() + RELAY_HTTP_SESSION_TTL_MS;
-  const session: HttpRelaySession = {
-    handle,
-    sessionId: consumedSession.sessionId,
-    serverId: consumedSession.serverId,
-    userId: consumedSession.userId,
-    sessionType: consumedSession.sessionType,
+  const session = createHttpRelaySessionRecord({
+    handle: crypto.randomUUID(),
+    consumedSession,
     tunnelConnectionId: tunnel.connectionId,
-    openedAt: new Date().toISOString(),
-    lastSeenAt: new Date().toISOString(),
-    expiresAt: Number.isFinite(cloudExpiresAt) ? Math.min(localExpiresAt, cloudExpiresAt) : localExpiresAt,
-    pendingRequests: new Map(),
-  };
+    ttlMs: RELAY_HTTP_SESSION_TTL_MS,
+  });
 
-  httpSessionsByHandle.set(handle, session);
-  httpSessionsById.set(session.sessionId, session);
+  httpSessionStore.add(session);
   tunnelRegistry.addSession(tunnel.connectionId, session.sessionId);
 
   sendJson(tunnel.socket, {
@@ -278,23 +237,22 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
 }
 
 function findHttpSessionFromRequest(req: Request): HttpRelaySession | null {
-  const handle = parseCookies(req.headers.cookie)[RELAY_HTTP_SESSION_COOKIE];
-  if (!handle) return null;
-  const session = httpSessionsByHandle.get(handle);
-  if (!session) return null;
-  if (session.expiresAt <= Date.now()) {
-    closeHttpRelaySession(session, 'Relay HTTP session expired');
-    return null;
-  }
-  session.lastSeenAt = new Date().toISOString();
-  return session;
+  return findHttpRelaySessionFromCookie({
+    cookieHeader: req.headers.cookie,
+    cookieName: RELAY_HTTP_SESSION_COOKIE,
+    store: httpSessionStore,
+    onExpired: (session) => closeHttpRelaySession(session, 'Relay HTTP session expired'),
+  });
 }
 
 async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, res: Response) {
   const tunnel = tunnelRegistry.getByConnectionId(session.tunnelConnectionId);
   if (!tunnel || tunnel.socket.readyState !== WebSocket.OPEN) {
     closeHttpRelaySession(session, 'Relay tunnel is unavailable');
-    res.setHeader('Set-Cookie', clearRelaySessionCookie());
+    res.setHeader('Set-Cookie', clearRelaySessionCookie({
+      cookieName: RELAY_HTTP_SESSION_COOKIE,
+      secure: process.env.NODE_ENV === 'production',
+    }));
     res.status(503).json({ error: 'Relay tunnel is unavailable' });
     return;
   }
@@ -332,7 +290,7 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
 
 function getOwnedHttpRelaySession(payload: JsonRecord, tunnel: TunnelConnection): HttpRelaySession | null {
   const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
-  const session = sessionId ? httpSessionsById.get(sessionId) : null;
+  const session = sessionId ? httpSessionStore.getBySessionId(sessionId) : null;
   if (!session) return null;
   if (session.tunnelConnectionId !== tunnel.connectionId) {
     relayWarn('relay rejected cross-tunnel http frame', {
@@ -444,7 +402,7 @@ function dropTunnel(connectionId: string, condition: RelayConditionResult): void
 
   for (const sessionId of Array.from(tunnel.sessions)) {
     closeSession(sessionId, 1011, toCloseReason(condition, 'Relay tunnel dropped'), condition);
-    const httpSession = httpSessionsById.get(sessionId);
+    const httpSession = httpSessionStore.getBySessionId(sessionId);
     if (httpSession) {
       closeHttpRelaySession(httpSession, 'Relay tunnel dropped');
     }
@@ -623,7 +581,7 @@ async function handleTunnelHeartbeat(tunnel: TunnelConnection, payload: JsonReco
       continue;
     }
 
-    const httpSession = httpSessionsById.get(sessionId);
+    const httpSession = httpSessionStore.getBySessionId(sessionId);
     if (httpSession?.tunnelConnectionId === tunnel.connectionId) {
       closeHttpRelaySession(httpSession, condition.detail);
     }
@@ -787,12 +745,18 @@ app.get(/^\/r\/([^/]+)(\/.*)?$/, async (req, res) => {
 
   try {
     const session = await createHttpRelaySession(decodeURIComponent(token));
-    const maxAgeSeconds = Math.max(60, Math.floor((session.expiresAt - Date.now()) / 1000));
-    const redirectTarget = `${pathAfterToken}${new URL(req.originalUrl, 'http://relay.local').search}`;
-    res.setHeader('Set-Cookie', relaySessionCookie(session.handle, maxAgeSeconds));
-    res.redirect(302, redirectTarget || '/');
+    res.setHeader('Set-Cookie', relaySessionCookie({
+      cookieName: RELAY_HTTP_SESSION_COOKIE,
+      handle: session.handle,
+      maxAgeSeconds: relaySessionMaxAgeSeconds(session.expiresAt),
+      secure: process.env.NODE_ENV === 'production',
+    }));
+    res.redirect(302, relayHandoffRedirectTarget(req.originalUrl, pathAfterToken));
   } catch (error) {
-    res.setHeader('Set-Cookie', clearRelaySessionCookie());
+    res.setHeader('Set-Cookie', clearRelaySessionCookie({
+      cookieName: RELAY_HTTP_SESSION_COOKIE,
+      secure: process.env.NODE_ENV === 'production',
+    }));
     res.status(409).json({
       error: error instanceof Error ? error.message : 'Unable to open relay session',
     });
@@ -933,7 +897,7 @@ tunnelWss.on('connection', (socket, req) => {
       case 'session-close': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
         if (!sessionId) break;
-        const httpSession = httpSessionsById.get(sessionId);
+        const httpSession = httpSessionStore.getBySessionId(sessionId);
         if (httpSession) {
           if (httpSession.tunnelConnectionId !== tunnel.connectionId) {
             relayWarn('relay rejected cross-tunnel http session close', {
