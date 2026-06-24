@@ -73,7 +73,7 @@ export function createRelayControlPlaneClient(
   };
 }
 
-export async function postRelayControlPlane<T>(input: {
+async function postRelayControlPlane<T>(input: {
   baseUrl: string;
   timeoutMs: number;
   fetchImpl: typeof fetch;
