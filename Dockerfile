@@ -15,10 +15,11 @@ COPY --from=omnilux-packages package.json pnpm-lock.yaml pnpm-workspace.yaml tsc
 COPY --from=omnilux-packages packages/types /omnilux-packages/packages/types
 COPY --from=omnilux-packages packages/api-contracts /omnilux-packages/packages/api-contracts
 RUN cd /omnilux-packages && pnpm install --frozen-lockfile && pnpm --filter @omnilux/types build && pnpm --filter @omnilux/api-contracts build
+RUN node -e "const fs=require('node:fs'); const file='/omnilux-packages/packages/api-contracts/package.json'; const pkg=JSON.parse(fs.readFileSync(file,'utf8')); pkg.dependencies['@omnilux/types']='file:/omnilux-packages/packages/types'; fs.writeFileSync(file, JSON.stringify(pkg,null,2)+'\n');"
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
-RUN node -e "const fs=require('node:fs'); const file='pnpm-workspace.yaml'; const source=fs.readFileSync(file,'utf8'); if (!source.includes('  - \".\"')) fs.writeFileSync(file, source.trimEnd() + '\n  - \".\"\n');"
-RUN pnpm install --force --frozen-lockfile && test -x node_modules/.bin/tsc
+COPY package.json pnpm-lock.yaml tsconfig.json ./
+RUN node -e "const fs=require('node:fs'); const file='package.json'; const pkg=JSON.parse(fs.readFileSync(file,'utf8')); pkg.dependencies['@omnilux/api-contracts']='file:/omnilux-packages/packages/api-contracts'; fs.writeFileSync(file, JSON.stringify(pkg,null,2)+'\n');"
+RUN pnpm install --no-frozen-lockfile && test -x node_modules/.bin/tsc
 
 COPY src ./src
 
@@ -36,9 +37,9 @@ WORKDIR /app
 
 COPY --from=builder /omnilux-packages /omnilux-packages
 
-COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN node -e "const fs=require('node:fs'); const file='pnpm-workspace.yaml'; const source=fs.readFileSync(file,'utf8'); if (!source.includes('  - \".\"')) fs.writeFileSync(file, source.trimEnd() + '\n  - \".\"\n');"
-RUN pnpm install --force --prod --frozen-lockfile && pnpm store prune
+COPY package.json pnpm-lock.yaml ./
+RUN node -e "const fs=require('node:fs'); const file='package.json'; const pkg=JSON.parse(fs.readFileSync(file,'utf8')); pkg.dependencies['@omnilux/api-contracts']='file:/omnilux-packages/packages/api-contracts'; fs.writeFileSync(file, JSON.stringify(pkg,null,2)+'\n');"
+RUN pnpm install --prod --no-frozen-lockfile && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
 
