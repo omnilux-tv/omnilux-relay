@@ -18,7 +18,7 @@ RUN cd /omnilux-packages && pnpm install --frozen-lockfile && pnpm --filter @omn
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
 RUN node -e "const fs=require('node:fs'); const file='pnpm-workspace.yaml'; const source=fs.readFileSync(file,'utf8'); if (!source.includes('  - \".\"')) fs.writeFileSync(file, source.trimEnd() + '\n  - \".\"\n');"
-RUN pnpm install --filter omnilux-relay... --frozen-lockfile && test -x node_modules/.bin/tsc
+RUN pnpm install --force --frozen-lockfile && test -x node_modules/.bin/tsc
 
 COPY src ./src
 
@@ -38,7 +38,7 @@ COPY --from=builder /omnilux-packages /omnilux-packages
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN node -e "const fs=require('node:fs'); const file='pnpm-workspace.yaml'; const source=fs.readFileSync(file,'utf8'); if (!source.includes('  - \".\"')) fs.writeFileSync(file, source.trimEnd() + '\n  - \".\"\n');"
-RUN pnpm install --filter omnilux-relay... --prod --frozen-lockfile && pnpm store prune
+RUN pnpm install --force --prod --frozen-lockfile && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
 
