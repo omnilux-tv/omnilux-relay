@@ -17,7 +17,7 @@ COPY --from=omnilux-packages packages/api-contracts /omnilux-packages/packages/a
 RUN cd /omnilux-packages && pnpm install --frozen-lockfile && pnpm --filter @omnilux/types build && pnpm --filter @omnilux/api-contracts build
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
-RUN pnpm install --frozen-lockfile
+RUN pnpm install --include-workspace-root --frozen-lockfile
 
 COPY src ./src
 
@@ -36,7 +36,7 @@ WORKDIR /app
 COPY --from=builder /omnilux-packages /omnilux-packages
 
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN pnpm install --prod --frozen-lockfile && pnpm store prune
+RUN pnpm install --include-workspace-root --prod --frozen-lockfile && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
 
