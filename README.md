@@ -9,6 +9,7 @@ This repository is part of the official OmniLux multi-repo workspace. Use the ro
 - Onboarding: `../ONBOARDING.md`
 - Manifest: `../workspace.repositories.json`
 - Contracts: `../contracts/`
+- Context: `./CONTEXT.md`
 
 This repo owns the remote-access transport layer only:
 
