@@ -27,7 +27,7 @@ jobs:
         with:
           repository: omnilux-tv/omnilux-packages
           path: shared/omnilux-packages
-          token: ${{ secrets.OMNILUX_PACKAGES_CHECKOUT_TOKEN }}
+          ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
 
       - uses: docker/setup-buildx-action@v3
 

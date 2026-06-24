@@ -17,7 +17,7 @@ jobs:
         with:
           repository: omnilux-tv/omnilux-packages
           path: shared/omnilux-packages
-          token: ${{ secrets.OMNILUX_PACKAGES_CHECKOUT_TOKEN }}
+          ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
 
       - name: Link shared packages
         run: ln -sfn "$GITHUB_WORKSPACE/shared/omnilux-packages" "$GITHUB_WORKSPACE/../omnilux-packages"
