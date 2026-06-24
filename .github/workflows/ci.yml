@@ -12,12 +12,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout shared packages
+        uses: actions/checkout@v5
+        with:
+          repository: omnilux-tv/omnilux-packages
+          path: shared/omnilux-packages
+          ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
+
+      - name: Link shared packages
+        run: ln -sfn "$GITHUB_WORKSPACE/shared/omnilux-packages" "$GITHUB_WORKSPACE/../omnilux-packages"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Enable pnpm
         run: corepack enable
+
+      - name: Install shared package dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: shared/omnilux-packages
+
+      - name: Build shared contracts
+        run: pnpm --filter @omnilux/types build && pnpm --filter @omnilux/api-contracts build
+        working-directory: shared/omnilux-packages
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile

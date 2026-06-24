@@ -22,6 +22,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Checkout shared packages
+        uses: actions/checkout@v5
+        with:
+          repository: omnilux-tv/omnilux-packages
+          path: shared/omnilux-packages
+          ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
@@ -47,6 +54,8 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-contexts: |
+            omnilux-packages=./shared/omnilux-packages
           load: true
           platforms: linux/amd64
           tags: omnilux-relay-verify:latest
@@ -63,6 +72,8 @@ jobs:
         with:
           context: .
           file: Dockerfile
+          build-contexts: |
+            omnilux-packages=./shared/omnilux-packages
           push: true
           platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}

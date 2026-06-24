@@ -11,7 +11,12 @@ RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml tsconfig.json ./
+COPY --from=omnilux-packages package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json /omnilux-packages/
+COPY --from=omnilux-packages packages/types /omnilux-packages/packages/types
+COPY --from=omnilux-packages packages/api-contracts /omnilux-packages/packages/api-contracts
+RUN cd /omnilux-packages && pnpm install --frozen-lockfile && pnpm --filter @omnilux/types build && pnpm --filter @omnilux/api-contracts build
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.json ./
 RUN pnpm install --frozen-lockfile
 
 COPY src ./src
@@ -28,7 +33,9 @@ LABEL org.opencontainers.image.title="OmniLux Relay" \
 
 WORKDIR /app
 
-COPY package.json pnpm-lock.yaml ./
+COPY --from=builder /omnilux-packages /omnilux-packages
+
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN pnpm install --prod --frozen-lockfile && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
