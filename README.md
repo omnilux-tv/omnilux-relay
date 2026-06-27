@@ -48,11 +48,11 @@ pnpm build
 - `RELAY_PORT` defaults to `8090`
 - `RELAY_CONTROL_URL` defaults to `https://api.omnilux.tv/functions/v1`
 - `relay.omnilux.tv` is the public ingress owned by `omnilux-edge`
-- `RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL` enables local verification for signed
-  `olrg_` relay grants issued by `omnilux-cloud`
+- `RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL` is required for local verification of
+  signed `olrg_` relay grants issued by `omnilux-cloud`
 - `RELAY_GRANT_AUDIENCE` defaults to `relay.omnilux.tv`
-- `RELAY_REQUIRE_SIGNED_SESSION_GRANTS=true` rejects legacy opaque `olrs_`
-  session tokens after migration is complete
+- Signed session grants are required by default. `RELAY_ALLOW_LEGACY_SESSION_GRANTS=true`
+  is a temporary migration-only override for legacy opaque `olrs_` session tokens.
 - `RELAY_HTTP_SESSION_COOKIE` defaults to `omnilux_relay_session`
 - `RELAY_HTTP_SESSION_TTL_MS` defaults to four hours
 - `RELAY_HTTP_REQUEST_TIMEOUT_MS` defaults to ten minutes
