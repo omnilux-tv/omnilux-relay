@@ -92,7 +92,8 @@ const RELAY_CONTROL_URL = process.env.RELAY_CONTROL_URL ?? 'https://api.omnilux.
 const RELAY_HEARTBEAT_INTERVAL_MS = Number(process.env.RELAY_HEARTBEAT_INTERVAL_MS ?? 30_000);
 const RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL = process.env.RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL?.trim() ?? '';
 const RELAY_GRANT_AUDIENCE = process.env.RELAY_GRANT_AUDIENCE?.trim() || 'relay.omnilux.tv';
-const RELAY_REQUIRE_SIGNED_SESSION_GRANTS = process.env.RELAY_REQUIRE_SIGNED_SESSION_GRANTS === 'true';
+const RELAY_ALLOW_LEGACY_SESSION_GRANTS = process.env.RELAY_ALLOW_LEGACY_SESSION_GRANTS === 'true';
+const RELAY_REQUIRE_SIGNED_SESSION_GRANTS = !RELAY_ALLOW_LEGACY_SESSION_GRANTS;
 const RELAY_GRANT_MAX_CLOCK_SKEW_MS = Number(process.env.RELAY_GRANT_MAX_CLOCK_SKEW_MS ?? 30_000);
 const RELAY_GRANT_MAX_TTL_MS = Number(process.env.RELAY_GRANT_MAX_TTL_MS ?? 5 * 60 * 1000);
 const RELAY_HTTP_SESSION_COOKIE = process.env.RELAY_HTTP_SESSION_COOKIE?.trim() || 'omnilux_relay_session';
@@ -106,6 +107,11 @@ const httpSessionStore = createRelayHttpSessionStore();
 const relayControlPlane = createRelayControlPlaneClient({
   baseUrl: RELAY_CONTROL_URL,
 });
+
+if (RELAY_REQUIRE_SIGNED_SESSION_GRANTS && !RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL) {
+  relayError('relay grant verification public key is required when signed session grants are enforced');
+  process.exit(1);
+}
 
 function getBearerToken(req: { headers: Record<string, string | string[] | undefined> }): string | null {
   const authorization = req.headers.authorization;

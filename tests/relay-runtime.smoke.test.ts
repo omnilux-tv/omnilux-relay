@@ -359,7 +359,8 @@ test('newer tunnels supersede older tunnels for the same server', async () => {
 });
 
 test('session websockets attach to an active tunnel and forward frames both directions', async () => {
-  controlPlaneState.sessionsByToken.set('session-token:server-session', {
+  const token = createSignedRelayGrantToken({ serverId: 'server-session' });
+  controlPlaneState.sessionsByToken.set(token, {
     sessionId: 'session-123',
     serverId: 'server-session',
     userId: 'user-123',
@@ -370,7 +371,7 @@ test('session websockets attach to an active tunnel and forward frames both dire
   const { socket: tunnelSocket } = await connectServerTunnel('server-token:server-session');
   const sessionSocket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
     headers: {
-      Authorization: 'Bearer session-token:server-session',
+      Authorization: `Bearer ${token}`,
     },
   });
 
@@ -672,15 +673,17 @@ test('session websocket rejects signed grants with more than one session before 
 });
 
 test('session websocket fails with not-found semantics when the control plane resolves a missing tunnel', async () => {
-  controlPlaneState.sessionsByToken.set('session-token:no-tunnel', {
+  const token = createSignedRelayGrantToken({ serverId: 'server-without-tunnel' });
+  controlPlaneState.sessionsByToken.set(token, {
     sessionId: 'session-missing',
     serverId: 'server-without-tunnel',
+    userId: 'user-123',
     sessionType: 'remote-play',
   });
 
   const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
     headers: {
-      Authorization: 'Bearer session-token:no-tunnel',
+      Authorization: `Bearer ${token}`,
     },
   });
 

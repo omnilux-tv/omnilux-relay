@@ -1,14 +1,29 @@
-name: CI
+name: Deploy Relay Worker
 
 on:
   push:
     branches:
       - main
-  pull_request:
+    paths:
+      - 'src/cloudflare/**'
+      - 'src/relay-condition.ts'
+      - 'src/relay-control-plane.ts'
+      - 'wrangler.jsonc'
+      - 'tsconfig.cloudflare.json'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/cloudflare-worker-deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
 
@@ -40,37 +55,11 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Lint
-        run: pnpm lint
-
       - name: Lint Cloudflare Worker
         run: pnpm lint:worker
-
-      - name: Smoke tests
-        run: pnpm test:smoke
-
-      - name: Build
-        run: pnpm build
 
       - name: Build Cloudflare Worker
         run: pnpm build:worker
 
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build relay image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          build-contexts: |
-            omnilux-packages=./shared/omnilux-packages
-          load: true
-          platforms: linux/amd64
-          tags: omnilux-relay-ci:latest
-
-      - name: Verify relay image artifact
-        run: |
-          docker run --rm --entrypoint sh omnilux-relay-ci:latest -lc '
-            set -eu
-            test -f /app/dist/index.js
-          '
+      - name: Deploy Cloudflare Worker
+        run: pnpm deploy:worker

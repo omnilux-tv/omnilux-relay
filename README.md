@@ -34,31 +34,79 @@ Transport changes that alter token, tunnel, session, heartbeat, or condition sem
 ```bash
 pnpm install
 pnpm dev
+pnpm dev:worker
 ```
 
 ## Checks
 
 ```bash
 pnpm lint
+pnpm lint:worker
 pnpm build
 ```
 
 ## Runtime contract
 
+This repo ships two relay runtimes:
+
+- `src/index.ts` is the Node/VPS relay runtime currently consumed by the public edge.
+- `src/cloudflare/index.ts` is the Cloudflare Worker + Durable Object relay runtime for the first global relay layer.
+
+Both runtimes preserve the same tunnel/session protocol:
+
+- self-hosted servers connect to `/ws/server` and register a tunnel with a relay tunnel token
+- cloud-created browser/client sessions connect through `/ws/session` or `/r/<relay-session-token>/`
+- relay sessions are consumed through `omnilux-cloud`
+- active server tunnels receive `session-open`, `session-frame`, and `session-close`
+- browser HTTP relay traffic is forwarded as `http-request` frames and returned as `http-response-*` frames
+
 - `RELAY_PORT` defaults to `8090`
 - `RELAY_CONTROL_URL` defaults to `https://api.omnilux.tv/functions/v1`
 - `relay.omnilux.tv` is the public ingress owned by `omnilux-edge`
-- `RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL` enables local verification for signed
-  `olrg_` relay grants issued by `omnilux-cloud`
+- `RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL` is required for local verification of
+  signed `olrg_` relay grants issued by `omnilux-cloud`
 - `RELAY_GRANT_AUDIENCE` defaults to `relay.omnilux.tv`
-- `RELAY_REQUIRE_SIGNED_SESSION_GRANTS=true` rejects legacy opaque `olrs_`
-  session tokens after migration is complete
+- Signed session grants are required by default. `RELAY_ALLOW_LEGACY_SESSION_GRANTS=true`
+  is a temporary migration-only override for legacy opaque `olrs_` session tokens.
 - `RELAY_HTTP_SESSION_COOKIE` defaults to `omnilux_relay_session`
 - `RELAY_HTTP_SESSION_TTL_MS` defaults to four hours
 - `RELAY_HTTP_REQUEST_TIMEOUT_MS` defaults to ten minutes
 - `RELAY_HTTP_REQUEST_BODY_MAX_BYTES` defaults to 25 MiB
 
 The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
+
+## Cloudflare Worker relay
+
+The Worker deploy target is configured in `wrangler.jsonc`.
+
+```bash
+pnpm lint:worker
+pnpm build:worker
+pnpm deploy:worker
+```
+
+Required Cloudflare secret:
+
+```bash
+pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.jsonc
+```
+
+Required GitHub Actions secrets for `.github/workflows/cloudflare-worker-deploy.yml`:
+
+- `CLOUDFLARE_API_TOKEN`
+- `CLOUDFLARE_ACCOUNT_ID`
+- `OMNILUX_PACKAGES_DEPLOY_KEY`
+
+The Durable Object binding is `RELAY_COORDINATOR`. The first deployment uses one
+named coordinator object (`RELAY_COORDINATOR_NAME=global`) so server tunnels and
+session attachment meet in the same hibernation-aware coordination point. This
+is the first production-shaped Cloudflare relay layer; future sharding should
+route by a stable server key once tunnel URLs or control-plane rendezvous carry
+that key before registration.
+
+Cloudflare TURN/WebRTC credentials are intentionally separate from this runtime.
+TURN is for NAT/firewall traversal on WebRTC-style paths, while this Worker
+implements the current WebSocket and browser HTTP relay contract.
 
 ## Browser HTTP relay
 

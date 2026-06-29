@@ -81,6 +81,15 @@ test('relay grant verification preserves unsigned-token compatibility when confi
   assert.deepEqual(result, { ok: true });
 });
 
+test('relay grant verification rejects unsigned tokens when signed grants are required', async () => {
+  const result = await verifyRelayGrantToken('legacy-session-token', basePolicy);
+
+  assert.equal(result.ok, false);
+  if (!result.ok) {
+    assert.equal(result.condition.detail, 'Signed relay session grant is required');
+  }
+});
+
 test('relay grant verification rejects invalid scope and signatures', async () => {
   const badScope = await verifyRelayGrantToken(createToken(createGrant({ scope: ['relay:inspect'] })), basePolicy);
   assert.equal(badScope.ok, false);
