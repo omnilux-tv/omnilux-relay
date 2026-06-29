@@ -9,8 +9,12 @@
   "packageManager": "pnpm@10.32.1",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "dev:worker": "wrangler dev --config wrangler.jsonc",
     "build": "tsc -p tsconfig.json",
+    "build:worker": "wrangler deploy --config wrangler.jsonc --dry-run",
     "lint": "tsc -p tsconfig.json --noEmit",
+    "lint:worker": "tsc -p tsconfig.cloudflare.json --noEmit",
+    "deploy:worker": "wrangler deploy --config wrangler.jsonc",
     "start": "node dist/index.js",
     "test:smoke": "node --test --import tsx tests/*.test.ts"
   },
@@ -21,10 +25,12 @@
     "ws": "^8.18.3"
   },
   "devDependencies": {
+    "@cloudflare/workers-types": "^4.20260628.1",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.9",
     "@types/ws": "^8.18.1",
     "tsx": "^4.19.3",
-    "typescript": "^5.8.2"
+    "typescript": "^5.8.2",
+    "wrangler": "^4.105.0"
   }
 }
