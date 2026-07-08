@@ -900,6 +900,8 @@ tunnelWss.on('connection', (socket, req) => {
         }
         break;
       }
+      case 'session-ready':
+        break;
       case 'session-close': {
         const sessionId = typeof payload.sessionId === 'string' ? payload.sessionId : null;
         if (!sessionId) break;

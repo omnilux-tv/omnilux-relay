@@ -39,7 +39,7 @@ COPY --from=builder /omnilux-packages /omnilux-packages
 
 COPY package.json pnpm-lock.yaml ./
 RUN node -e "const fs=require('node:fs'); const file='package.json'; const pkg=JSON.parse(fs.readFileSync(file,'utf8')); pkg.dependencies['@omnilux/api-contracts']='file:/omnilux-packages/packages/api-contracts'; fs.writeFileSync(file, JSON.stringify(pkg,null,2)+'\n');"
-RUN pnpm install --prod --no-frozen-lockfile && pnpm store prune
+RUN HUSKY=0 pnpm install --prod --no-frozen-lockfile --ignore-scripts && pnpm store prune
 
 COPY --from=builder /app/dist ./dist
 
