@@ -798,7 +798,7 @@ export class RelayCoordinator {
           requestId,
           method: request.method,
           path: `${url.pathname}${url.search}`,
-          headers: sanitizeRelayIncomingHeaders(request.headers),
+          headers: sanitizeRelayIncomingHeaders(request.headers, [this.httpSessionCookieName()]),
           bodyEncoding: body ? 'base64' : undefined,
           body: body ? bytesToBase64(body) : undefined,
         }),
@@ -841,7 +841,7 @@ export class RelayCoordinator {
     const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
     if (!pending) return;
     pending.status = validHttpStatus(payload.status) ? payload.status : 502;
-    pending.headers = sanitizeRelayOutgoingHeaders(payload.headers);
+    pending.headers = sanitizeRelayOutgoingHeaders(payload.headers, [this.httpSessionCookieName()]);
   }
 
   private handleHttpResponseBody(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
@@ -1302,7 +1302,7 @@ function relaySessionCookie(input: {
   secure: boolean;
 }): string {
   const secure = input.secure ? '; Secure' : '';
-  return `${input.cookieName}=${encodeURIComponent(input.handle)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${input.maxAgeSeconds}${secure}`;
+  return `${input.cookieName}=${encodeURIComponent(input.handle)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${input.maxAgeSeconds}${secure}`;
 }
 
 function clearRelaySessionCookie(input: {
@@ -1310,7 +1310,7 @@ function clearRelaySessionCookie(input: {
   secure: boolean;
 }): string {
   const secure = input.secure ? '; Secure' : '';
-  return `${input.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`;
+  return `${input.cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`;
 }
 
 function relaySessionMaxAgeSeconds(expiresAt: number, now = new Date()): number {
@@ -1326,17 +1326,18 @@ async function readRequestBody(request: Request, maxBytes: number): Promise<Uint
   return bytes.byteLength > 0 ? bytes : undefined;
 }
 
-function sanitizeRelayIncomingHeaders(headers: Headers): Array<[string, string]> {
+function sanitizeRelayIncomingHeaders(headers: Headers, protectedCookieNames: string[] = []): Array<[string, string]> {
   const pairs: Array<[string, string]> = [];
   headers.forEach((value, name) => {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower) || lower.startsWith('sec-websocket-')) return;
-    pairs.push([name, value]);
+    const sanitized = lower === 'cookie' ? sanitizeCookieHeader(value, protectedCookieNames) : value;
+    if (sanitized) pairs.push([name, sanitized]);
   });
   return pairs;
 }
 
-function sanitizeRelayOutgoingHeaders(headers: unknown): Headers {
+function sanitizeRelayOutgoingHeaders(headers: unknown, protectedCookieNames: string[] = []): Headers {
   const normalized = new Headers({ 'Cache-Control': 'private, no-store' });
   if (!Array.isArray(headers)) return normalized;
 
@@ -1346,10 +1347,30 @@ function sanitizeRelayOutgoingHeaders(headers: unknown): Headers {
     if (typeof name !== 'string' || typeof value !== 'string') continue;
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower === 'set-cookie' && isProtectedSetCookie(value, protectedCookieNames)) continue;
     normalized.append(name, value);
   }
 
   return normalized;
+}
+
+function sanitizeCookieHeader(value: string, protectedCookieNames: string[]): string | null {
+  if (protectedCookieNames.length === 0) return value;
+  const protectedNames = new Set(protectedCookieNames.map((name) => name.toLowerCase()));
+  const segments = value
+    .split(';')
+    .map((segment) => segment.trim())
+    .filter((segment) => {
+      const [name] = segment.split('=', 1);
+      return name && !protectedNames.has(name.toLowerCase());
+    });
+  return segments.length > 0 ? segments.join('; ') : null;
+}
+
+function isProtectedSetCookie(value: string, protectedCookieNames: string[]): boolean {
+  if (protectedCookieNames.length === 0) return false;
+  const [name] = value.split('=', 1);
+  return Boolean(name && protectedCookieNames.some((cookieName) => cookieName.toLowerCase() === name.toLowerCase()));
 }
 
 function parseCookies(cookieHeader: string | null): Record<string, string> {

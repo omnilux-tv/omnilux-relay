@@ -279,7 +279,7 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
         requestId,
         method: req.method,
         path: req.originalUrl || '/',
-        headers: sanitizeRelayIncomingHeaders(req.headers),
+        headers: sanitizeRelayIncomingHeaders(req.headers, [RELAY_HTTP_SESSION_COOKIE]),
         bodyEncoding: body ? 'base64' : undefined,
         body: body ? body.toString('base64') : undefined,
       }),
@@ -317,7 +317,10 @@ function handleHttpResponseStart(payload: JsonRecord, tunnel: TunnelConnection) 
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!session || !requestId || !pending || pending.response.headersSent) return;
 
-  const result = startRelayHttpResponse(pending, payload);
+  const result = startRelayHttpResponse(pending, {
+    ...payload,
+    protectedCookieNames: [RELAY_HTTP_SESSION_COOKIE],
+  });
   if (!result.ok) {
     relayWarn('relay rejected malformed http response headers', {
       sessionId,
