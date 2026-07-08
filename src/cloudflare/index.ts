@@ -381,6 +381,8 @@ export class RelayCoordinator {
       case 'session-frame':
         this.forwardTunnelSessionFrame(payload, registeredAttachment);
         break;
+      case 'session-ready':
+        break;
       case 'session-close':
         await this.handleTunnelSessionClose(payload, registeredAttachment);
         break;
