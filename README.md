@@ -42,6 +42,7 @@ pnpm dev:worker
 ```bash
 pnpm lint
 pnpm lint:worker
+pnpm test:worker-smoke
 pnpm build
 ```
 
@@ -81,9 +82,23 @@ The Worker deploy target is configured in `wrangler.jsonc`.
 
 ```bash
 pnpm lint:worker
+pnpm test:worker-smoke
 pnpm build:worker
 pnpm deploy:worker
 ```
+
+`pnpm test:worker-smoke` runs the Worker/Durable Object parity smoke locally through Wrangler dev. It does not mutate production Cloudflare state. The smoke covers `/readyz`, tunnel registration, signed session attach, signed-grant purpose rejection, browser HTTP relay handoff, and fail-closed behavior when signed-grant verification keys are missing or invalid.
+
+Guaranteed parity with the Node/VPS relay:
+
+- Both runtimes require signed relay grants by default and consume sessions through `omnilux-cloud`.
+- Both runtimes register server tunnels, emit `session-open`, forward WebSocket frames, and proxy browser HTTP traffic as `http-request` / `http-response-*` frames.
+- Both runtimes strip relay control cookies before origin forwarding and prevent tunneled origins from replacing the relay session cookie.
+
+Runtime-specific differences:
+
+- The Node/VPS relay owns the container image consumed by `omnilux-edge` and runs Express + `ws`.
+- The Cloudflare relay uses a Worker front door plus a single named Durable Object coordinator. It is currently a parity target for global relay layering and should remain covered by local Wrangler smoke before deployment.
 
 Required Cloudflare secret:
 
@@ -171,13 +186,13 @@ Control-plane compatibility:
 
 Product condition mapping:
 
-| Transport condition | Product condition |
-| --- | --- |
-| `connected` | `online` |
-| `degraded` | `degraded` |
-| `unauthorized` | `not_configured` or `not_entitled`, depending on control-plane reason |
-| `expired` | `waiting_for_tunnel` or `offline`, depending on whether the server can refresh |
-| `revoked` | `not_entitled` or `not_configured`, depending on revocation reason |
-| `unreachable` | `waiting_for_tunnel` or `offline`, depending on whether a tunnel was previously established |
+| Transport condition | Product condition                                                                           |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| `connected`         | `online`                                                                                    |
+| `degraded`          | `degraded`                                                                                  |
+| `unauthorized`      | `not_configured` or `not_entitled`, depending on control-plane reason                       |
+| `expired`           | `waiting_for_tunnel` or `offline`, depending on whether the server can refresh              |
+| `revoked`           | `not_entitled` or `not_configured`, depending on revocation reason                          |
+| `unreachable`       | `waiting_for_tunnel` or `offline`, depending on whether a tunnel was previously established |
 
 The relay should not invent user-facing copy. Cloud/local UI maps product conditions to trust vocabulary.

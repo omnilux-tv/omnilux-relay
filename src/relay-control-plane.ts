@@ -1,4 +1,4 @@
-import type { JsonRecord } from './relay-condition.js';
+import type { JsonRecord } from "./relay-condition.js";
 
 export type RelayControlPlaneResult<T> =
   | { ok: true; status: number; data: T }
@@ -31,15 +31,15 @@ export type ConsumedRelaySession = {
 export type RelayControlPlaneClient = {
   registerRelayConnection: (
     token: string,
-    body: JsonRecord,
+    body: JsonRecord
   ) => Promise<RelayControlPlaneResult<RelayConnectionRegistration>>;
   recordRelayHeartbeat: (
     token: string,
-    body: JsonRecord,
+    body: JsonRecord
   ) => Promise<RelayControlPlaneResult<RelayHeartbeatResult>>;
   consumeRelaySession: (
     token: string,
-    body: JsonRecord,
+    body: JsonRecord
   ) => Promise<RelayControlPlaneResult<ConsumedRelaySession>>;
 };
 
@@ -50,14 +50,14 @@ export type RelayControlPlaneClientOptions = {
 };
 
 export function createRelayControlPlaneClient(
-  options: RelayControlPlaneClientOptions,
+  options: RelayControlPlaneClientOptions
 ): RelayControlPlaneClient {
   const timeoutMs = options.timeoutMs ?? 10_000;
   const post = <T>(path: string, token: string, body: JsonRecord) =>
     postRelayControlPlane<T>({
       baseUrl: options.baseUrl,
       timeoutMs,
-      fetchImpl: options.fetchImpl ?? fetch,
+      fetchImpl: options.fetchImpl ?? ((input, init) => fetch(input, init)),
       path,
       token,
       body,
@@ -65,11 +65,15 @@ export function createRelayControlPlaneClient(
 
   return {
     registerRelayConnection: (token, body) =>
-      post<RelayConnectionRegistration>('register-relay-connection', token, body),
+      post<RelayConnectionRegistration>(
+        "register-relay-connection",
+        token,
+        body
+      ),
     recordRelayHeartbeat: (token, body) =>
-      post<RelayHeartbeatResult>('relay-heartbeat', token, body),
+      post<RelayHeartbeatResult>("relay-heartbeat", token, body),
     consumeRelaySession: (token, body) =>
-      post<ConsumedRelaySession>('consume-relay-session', token, body),
+      post<ConsumedRelaySession>("consume-relay-session", token, body),
   };
 }
 
@@ -83,9 +87,9 @@ async function postRelayControlPlane<T>(input: {
 }): Promise<RelayControlPlaneResult<T>> {
   try {
     const response = await input.fetchImpl(`${input.baseUrl}/${input.path}`, {
-      method: 'POST',
+      method: "POST",
       headers: {
-        'Content-Type': 'application/json',
+        "Content-Type": "application/json",
         Authorization: `Bearer ${input.token}`,
       },
       body: JSON.stringify(input.body),
@@ -93,7 +97,7 @@ async function postRelayControlPlane<T>(input: {
     });
 
     const text = await response.text();
-    const data = text ? JSON.parse(text) as T : undefined;
+    const data = text ? (JSON.parse(text) as T) : undefined;
 
     return response.ok && data !== undefined
       ? { ok: true, status: response.status, data }
@@ -106,7 +110,10 @@ async function postRelayControlPlane<T>(input: {
     return {
       ok: false,
       status: 0,
-      error: error instanceof Error ? error.message : 'Unknown relay control-plane error',
+      error:
+        error instanceof Error
+          ? error.message
+          : "Unknown relay control-plane error",
     };
   }
 }
