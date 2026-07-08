@@ -17,6 +17,7 @@
     "deploy:worker": "wrangler deploy --config wrangler.jsonc",
     "start": "node dist/index.js",
     "test:smoke": "node --test --import tsx tests/*.test.ts",
+    "test:worker-smoke": "node --test --import tsx tests/relay-worker-runtime.smoke.test.ts",
     "prepare": "husky"
   },
   "dependencies": {
