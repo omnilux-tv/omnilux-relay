@@ -36,21 +36,29 @@ const HOP_BY_HOP_HEADERS = new Set([
 
 export function sanitizeRelayIncomingHeaders(
   headers: Record<string, string | string[] | undefined>,
+  protectedCookieNames: string[] = [],
 ): Array<[string, string]> {
   const pairs: Array<[string, string]> = [];
   for (const [name, value] of Object.entries(headers)) {
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower) || lower.startsWith('sec-websocket-')) continue;
     if (Array.isArray(value)) {
-      for (const item of value) pairs.push([name, item]);
+      for (const item of value) {
+        const sanitized = lower === 'cookie' ? sanitizeCookieHeader(item, protectedCookieNames) : item;
+        if (sanitized) pairs.push([name, sanitized]);
+      }
     } else if (typeof value === 'string') {
-      pairs.push([name, value]);
+      const sanitized = lower === 'cookie' ? sanitizeCookieHeader(value, protectedCookieNames) : value;
+      if (sanitized) pairs.push([name, sanitized]);
     }
   }
   return pairs;
 }
 
-export function sanitizeRelayOutgoingHeaders(headers: unknown): Map<string, string[]> {
+export function sanitizeRelayOutgoingHeaders(
+  headers: unknown,
+  options: { protectedCookieNames?: string[] } = {},
+): Map<string, string[]> {
   const normalized = new Map<string, string[]>();
   if (!Array.isArray(headers)) return normalized;
 
@@ -60,12 +68,32 @@ export function sanitizeRelayOutgoingHeaders(headers: unknown): Map<string, stri
     if (typeof name !== 'string' || typeof value !== 'string') continue;
     const lower = name.toLowerCase();
     if (HOP_BY_HOP_HEADERS.has(lower)) continue;
+    if (lower === 'set-cookie' && isProtectedSetCookie(value, options.protectedCookieNames ?? [])) continue;
     const existing = normalized.get(lower) ?? [];
     existing.push(value);
     normalized.set(lower, existing);
   }
 
   return normalized;
+}
+
+function sanitizeCookieHeader(value: string, protectedCookieNames: string[]): string | null {
+  if (protectedCookieNames.length === 0) return value;
+  const protectedNames = new Set(protectedCookieNames.map((name) => name.toLowerCase()));
+  const segments = value
+    .split(';')
+    .map((segment) => segment.trim())
+    .filter((segment) => {
+      const [name] = segment.split('=', 1);
+      return name && !protectedNames.has(name.toLowerCase());
+    });
+  return segments.length > 0 ? segments.join('; ') : null;
+}
+
+function isProtectedSetCookie(value: string, protectedCookieNames: string[]): boolean {
+  if (protectedCookieNames.length === 0) return false;
+  const [name] = value.split('=', 1);
+  return Boolean(name && protectedCookieNames.some((cookieName) => cookieName.toLowerCase() === name.toLowerCase()));
 }
 
 export async function readRelayHttpRequestBody(
@@ -156,7 +184,11 @@ export function startRelayHttpResponse(
     && payload.status <= 599
     ? payload.status
     : 502;
-  const headers = sanitizeRelayOutgoingHeaders(payload.headers);
+  const headers = sanitizeRelayOutgoingHeaders(payload.headers, {
+    protectedCookieNames: Array.isArray(payload.protectedCookieNames)
+      ? payload.protectedCookieNames.filter((name): name is string => typeof name === 'string')
+      : [],
+  });
   pending.response.status(status);
   pending.response.setHeader('Cache-Control', 'private, no-store');
 

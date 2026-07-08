@@ -115,7 +115,7 @@ export function relaySessionCookie(input: {
   secure: boolean;
 }): string {
   const secure = input.secure ? '; Secure' : '';
-  return `${input.cookieName}=${encodeURIComponent(input.handle)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${input.maxAgeSeconds}${secure}`;
+  return `${input.cookieName}=${encodeURIComponent(input.handle)}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${input.maxAgeSeconds}${secure}`;
 }
 
 export function clearRelaySessionCookie(input: {
@@ -123,7 +123,7 @@ export function clearRelaySessionCookie(input: {
   secure: boolean;
 }): string {
   const secure = input.secure ? '; Secure' : '';
-  return `${input.cookieName}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0${secure}`;
+  return `${input.cookieName}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure}`;
 }
 
 export function relaySessionMaxAgeSeconds(expiresAt: number, now = new Date()): number {

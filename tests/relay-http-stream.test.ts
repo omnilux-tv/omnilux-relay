@@ -83,6 +83,32 @@ test('relay HTTP stream filters hop-by-hop and websocket headers', () => {
   ]);
 });
 
+test('relay HTTP stream strips relay control cookies before forwarding to the origin', () => {
+  assert.deepEqual(
+    sanitizeRelayIncomingHeaders(
+      {
+        cookie: 'theme=dark; omnilux_relay_session=relay-handle; session=origin-session',
+        accept: 'text/html',
+      },
+      ['omnilux_relay_session'],
+    ),
+    [
+      ['cookie', 'theme=dark; session=origin-session'],
+      ['accept', 'text/html'],
+    ],
+  );
+
+  assert.deepEqual(
+    sanitizeRelayIncomingHeaders(
+      {
+        cookie: 'omnilux_relay_session=relay-handle',
+      },
+      ['omnilux_relay_session'],
+    ),
+    [],
+  );
+});
+
 test('relay HTTP stream reads request bodies within the configured limit', async () => {
   const req = Object.assign(bodyChunks(['abc', Buffer.from('def')]), { method: 'POST' });
 
@@ -131,9 +157,11 @@ test('relay HTTP stream starts, writes, and ends a pending response', () => {
     headers: [
       ['content-type', 'text/plain'],
       ['set-cookie', 'a=1'],
+      ['set-cookie', 'omnilux_relay_session=attacker; Path=/'],
       ['set-cookie', 'b=2'],
       ['connection', 'close'],
     ],
+    protectedCookieNames: ['omnilux_relay_session'],
   });
 
   assert.deepEqual(result, { ok: true });

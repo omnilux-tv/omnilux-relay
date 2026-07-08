@@ -43,11 +43,11 @@ test('renders relay handoff cookies and redirect targets from one Interface', ()
       maxAgeSeconds: 120,
       secure: true,
     }),
-    'omnilux_relay_session=handle%20with%20spaces; HttpOnly; SameSite=Lax; Path=/; Max-Age=120; Secure',
+    'omnilux_relay_session=handle%20with%20spaces; HttpOnly; SameSite=Strict; Path=/; Max-Age=120; Secure',
   );
   assert.equal(
     clearRelaySessionCookie({ cookieName: 'omnilux_relay_session', secure: false }),
-    'omnilux_relay_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0',
+    'omnilux_relay_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0',
   );
   assert.equal(
     relaySessionMaxAgeSeconds(new Date('2026-06-24T10:02:30.000Z').getTime(), new Date('2026-06-24T10:00:00.000Z')),
