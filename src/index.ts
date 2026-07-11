@@ -19,6 +19,7 @@ import {
 } from './relay-grant-verification.js';
 import { createRelayControlPlaneClient } from './relay-control-plane.js';
 import {
+  cancelPendingHttpRelayRequest,
   closePendingHttpRelayRequests,
   endPendingHttpRelayRequest,
   failPendingHttpRelayRequest,
@@ -100,6 +101,22 @@ const RELAY_HTTP_SESSION_COOKIE = process.env.RELAY_HTTP_SESSION_COOKIE?.trim() 
 const RELAY_HTTP_SESSION_TTL_MS = Number(process.env.RELAY_HTTP_SESSION_TTL_MS ?? 4 * 60 * 60 * 1000);
 const RELAY_HTTP_REQUEST_TIMEOUT_MS = Number(process.env.RELAY_HTTP_REQUEST_TIMEOUT_MS ?? 10 * 60 * 1000);
 const RELAY_HTTP_REQUEST_BODY_MAX_BYTES = Number(process.env.RELAY_HTTP_REQUEST_BODY_MAX_BYTES ?? 25 * 1024 * 1024);
+const RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES = Number(
+  process.env.RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES ?? 1024 * 1024,
+);
+const RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES = Number(
+  process.env.RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES ?? 1024 * 1024,
+);
+
+for (const [name, value] of [
+  ['RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES', RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES],
+  ['RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES', RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES],
+] as const) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    relayError(`${name} must be a positive integer`);
+    process.exit(1);
+  }
+}
 
 const tunnelRegistry = createRelayTunnelRegistry();
 const sessionsById = new Map<string, RelaySession>();
@@ -277,7 +294,21 @@ async function forwardHttpRelayRequest(session: HttpRelaySession, req: Request, 
 
   const requestId = openPendingHttpRelayRequest(session, res, {
     timeoutMs: RELAY_HTTP_REQUEST_TIMEOUT_MS,
+    maxBufferedBytes: RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES,
     createRequestId: crypto.randomUUID,
+    cancelUpstream: (_requestId, reason) => {
+      if (tunnel.socket.readyState !== WebSocket.OPEN) return;
+      sendJson(tunnel.socket, {
+        type: 'session-frame',
+        sessionId: session.sessionId,
+        encoding: 'text',
+        data: JSON.stringify({
+          type: 'http-request-cancel',
+          requestId: _requestId,
+          reason,
+        }),
+      });
+    },
   });
 
   try {
@@ -350,7 +381,15 @@ function handleHttpResponseBody(payload: JsonRecord, tunnel: TunnelConnection) {
   const pending = requestId && session ? session.pendingRequests.get(requestId) : null;
   if (!pending || pending.response.writableEnded) return;
 
-  writeRelayHttpResponseBody(pending, payload);
+  const result = writeRelayHttpResponseBody(pending, payload);
+  if (!result.ok && session && requestId) {
+    relayWarn('relay cancelled bounded http response', {
+      sessionId: session.sessionId,
+      requestId,
+      error: result.error,
+    });
+    cancelPendingHttpRelayRequest(session, requestId, result.error);
+  }
 }
 
 function handleHttpResponseEnd(payload: JsonRecord, tunnel: TunnelConnection) {
@@ -805,8 +844,14 @@ app.use((req, res, next) => {
 });
 
 const server = createServer(app);
-const tunnelWss = new WebSocketServer({ noServer: true });
-const sessionWss = new WebSocketServer({ noServer: true });
+const tunnelWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES,
+});
+const sessionWss = new WebSocketServer({
+  noServer: true,
+  maxPayload: RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES,
+});
 
 tunnelWss.on('connection', (socket, req) => {
   const token = getBearerToken(req);

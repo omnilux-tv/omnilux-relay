@@ -9,13 +9,13 @@
   "workers_dev": false,
   "routes": [],
   "vars": {
-    "RELAY_CONTROL_URL": "https://api.omnilux.tv/functions/v1",
-    "RELAY_GRANT_AUDIENCE": "relay.omnilux.tv",
-    "RELAY_LEGACY_COORDINATOR_NAME": "global",
+    "RELAY_CONTROL_URL": "https://api-test.omnilux.tv/functions/v1",
+    "RELAY_GRANT_AUDIENCE": "relay-test.omnilux.tv",
+    "RELAY_LEGACY_COORDINATOR_NAME": "staging-global",
     "RELAY_RENDEZVOUS_NAME": "relay-rendezvous-v1",
     "RELAY_RENDEZVOUS_PARTITIONS": "64",
-    "RELAY_HTTP_SESSION_COOKIE": "omnilux_relay_session",
-    "RELAY_REGION": "cloudflare-global"
+    "RELAY_HTTP_SESSION_COOKIE": "omnilux_relay_staging_session",
+    "RELAY_REGION": "cloudflare-local-validation"
   },
   "durable_objects": {
     "bindings": [

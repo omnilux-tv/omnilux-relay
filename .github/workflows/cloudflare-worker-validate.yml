@@ -79,6 +79,3 @@ jobs:
 
       - name: Build staging Worker without deployment
         run: pnpm build:worker:staging
-
-      - name: Build production Worker without deployment
-        run: pnpm build:worker:production

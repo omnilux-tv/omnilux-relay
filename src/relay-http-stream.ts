@@ -9,12 +9,16 @@ export type RelayHttpResponseLike = {
   write: (chunk: string | Buffer) => unknown;
   setHeader: (name: string, value: string | string[]) => unknown;
   on?: (event: 'close', listener: () => void) => unknown;
+  writableLength?: number;
 };
 
 export interface PendingHttpRelayRequest {
   response: RelayHttpResponseLike;
   timeout: NodeJS.Timeout;
   started: boolean;
+  maxBufferedBytes: number;
+  cancelUpstream?: (reason: string) => void;
+  upstreamCancelled: boolean;
 }
 
 export interface HttpRelayStreamSession {
@@ -131,7 +135,9 @@ export function openPendingHttpRelayRequest(
   response: RelayHttpResponseLike,
   options: {
     timeoutMs: number;
+    maxBufferedBytes?: number;
     createRequestId: () => string;
+    cancelUpstream?: (requestId: string, reason: string) => void;
   },
 ): string {
   const requestId = options.createRequestId();
@@ -143,11 +149,17 @@ export function openPendingHttpRelayRequest(
     response,
     timeout,
     started: false,
+    maxBufferedBytes: options.maxBufferedBytes ?? Number.MAX_SAFE_INTEGER,
+    cancelUpstream: options.cancelUpstream
+      ? (reason) => options.cancelUpstream?.(requestId, reason)
+      : undefined,
+    upstreamCancelled: false,
   });
 
   response.on?.('close', () => {
     if (response.writableEnded) return;
-    removePendingHttpRelayRequest(session, requestId);
+    const pending = removePendingHttpRelayRequest(session, requestId);
+    if (pending) cancelRelayHttpUpstream(pending, 'Relay HTTP client disconnected');
   });
 
   return requestId;
@@ -168,6 +180,7 @@ export function closePendingHttpRelayRequests(session: HttpRelayStreamSession, r
   for (const requestId of Array.from(session.pendingRequests.keys())) {
     const pending = removePendingHttpRelayRequest(session, requestId);
     if (!pending) continue;
+    cancelRelayHttpUpstream(pending, reason);
     failRelayHttpResponse(pending.response, 502, reason);
   }
 }
@@ -210,12 +223,43 @@ export function startRelayHttpResponse(
   return { ok: true };
 }
 
-export function writeRelayHttpResponseBody(pending: PendingHttpRelayRequest, payload: JsonRecord): void {
-  if (pending.response.writableEnded) return;
+export function writeRelayHttpResponseBody(
+  pending: PendingHttpRelayRequest,
+  payload: JsonRecord,
+): { ok: true; backpressured: boolean } | { ok: false; error: string } {
+  if (pending.response.writableEnded) {
+    return { ok: false, error: 'Relay HTTP response consumer is closed' };
+  }
 
   const data = typeof payload.data === 'string' ? payload.data : '';
   const chunk = payload.encoding === 'base64' ? Buffer.from(data, 'base64') : data;
-  pending.response.write(chunk);
+  const chunkBytes = typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
+  const writableLength = Number.isFinite(pending.response.writableLength)
+    ? Math.max(0, Number(pending.response.writableLength))
+    : 0;
+  if (
+    chunkBytes > pending.maxBufferedBytes
+    || writableLength + chunkBytes > pending.maxBufferedBytes
+  ) {
+    return {
+      ok: false,
+      error: 'Relay HTTP response exceeded the bounded stream buffer',
+    };
+  }
+
+  const accepted = pending.response.write(chunk);
+  return { ok: true, backpressured: accepted === false };
+}
+
+export function cancelPendingHttpRelayRequest(
+  session: HttpRelayStreamSession,
+  requestId: string,
+  reason: string,
+): void {
+  const pending = removePendingHttpRelayRequest(session, requestId);
+  if (!pending) return;
+  cancelRelayHttpUpstream(pending, reason);
+  failRelayHttpResponse(pending.response, 502, reason);
 }
 
 export function endPendingHttpRelayRequest(session: HttpRelayStreamSession, requestId: string): void {
@@ -238,7 +282,14 @@ function timeoutPendingHttpRelayRequest(session: HttpRelayStreamSession, request
   const pending = session.pendingRequests.get(requestId);
   if (!pending) return;
   session.pendingRequests.delete(requestId);
+  cancelRelayHttpUpstream(pending, 'Relay HTTP request timed out');
   failRelayHttpResponse(pending.response, 504, 'Relay HTTP request timed out');
+}
+
+function cancelRelayHttpUpstream(pending: PendingHttpRelayRequest, reason: string): void {
+  if (pending.upstreamCancelled) return;
+  pending.upstreamCancelled = true;
+  pending.cancelUpstream?.(reason);
 }
 
 function failRelayHttpResponse(response: RelayHttpResponseLike, status: number, message: string): void {

@@ -279,6 +279,7 @@ before(async () => {
       RELAY_PORT: String(relayPort),
       RELAY_CONTROL_URL: `${controlPlaneOrigin}/functions/v1`,
       RELAY_HEARTBEAT_INTERVAL_MS: '1000',
+      RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES: '2048',
       RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL: relayGrantPublicKeySpki,
     },
     stdio: 'pipe',
@@ -365,6 +366,15 @@ test('server tunnel registers and acknowledges heartbeats through the control pl
   assert.equal(controlPlaneState.heartbeatCalls.length, 1);
 
   await closeSocket(socket);
+});
+
+test('server tunnel rejects websocket messages above the configured production bound', async () => {
+  const { socket } = await connectServerTunnel('server-token:server-oversized-frame');
+  const close = nextCloseEvent(socket);
+  socket.send('x'.repeat(4096));
+
+  const closeEvent = await close;
+  assert.equal(closeEvent.code, 1009);
 });
 
 test('newer tunnels supersede older tunnels for the same server', async () => {

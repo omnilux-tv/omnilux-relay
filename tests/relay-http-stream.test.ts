@@ -3,6 +3,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { test } from 'node:test';
 import {
   closePendingHttpRelayRequests,
+  cancelPendingHttpRelayRequest,
   endPendingHttpRelayRequest,
   openPendingHttpRelayRequest,
   readRelayHttpRequestBody,
@@ -16,13 +17,17 @@ import {
 class FakeResponse implements RelayHttpResponseLike {
   headersSent = false;
   writableEnded = false;
+  writableLength = 0;
   statusCode = 200;
   jsonBody: unknown;
   chunks: Array<string | Buffer> = [];
   headers = new Map<string, string | string[]>();
   closeListeners: Array<() => void> = [];
 
-  constructor(private readonly throwHeader = false) {}
+  constructor(
+    private readonly throwHeader = false,
+    private readonly acceptWrites = true,
+  ) {}
 
   status(code: number): RelayHttpResponseLike {
     this.statusCode = code;
@@ -44,7 +49,8 @@ class FakeResponse implements RelayHttpResponseLike {
   write(chunk: string | Buffer): unknown {
     this.headersSent = true;
     this.chunks.push(chunk);
-    return true;
+    this.writableLength += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.byteLength;
+    return this.acceptWrites;
   }
 
   setHeader(name: string, value: string | string[]): unknown {
@@ -127,9 +133,11 @@ test('relay HTTP stream times out pending requests and removes them', async () =
   const session: HttpRelayStreamSession = { pendingRequests: new Map() };
   const response = new FakeResponse();
 
+  const cancellations: string[] = [];
   const requestId = openPendingHttpRelayRequest(session, response, {
     timeoutMs: 1,
     createRequestId: () => 'request-1',
+    cancelUpstream: (_requestId, reason) => cancellations.push(reason),
   });
 
   assert.equal(requestId, 'request-1');
@@ -140,6 +148,7 @@ test('relay HTTP stream times out pending requests and removes them', async () =
   assert.equal(session.pendingRequests.has('request-1'), false);
   assert.equal(response.statusCode, 504);
   assert.deepEqual(response.jsonBody, { error: 'Relay HTTP request timed out' });
+  assert.deepEqual(cancellations, ['Relay HTTP request timed out']);
 });
 
 test('relay HTTP stream starts, writes, and ends a pending response', () => {
@@ -170,10 +179,10 @@ test('relay HTTP stream starts, writes, and ends a pending response', () => {
   assert.equal(response.headers.get('content-type'), 'text/plain');
   assert.deepEqual(response.headers.get('set-cookie'), ['a=1', 'b=2']);
 
-  writeRelayHttpResponseBody(pending, {
+  assert.deepEqual(writeRelayHttpResponseBody(pending, {
     encoding: 'base64',
     data: Buffer.from('hello').toString('base64'),
-  });
+  }), { ok: true, backpressured: false });
   endPendingHttpRelayRequest(session, requestId);
 
   assert.deepEqual(response.chunks, [Buffer.from('hello')]);
@@ -202,4 +211,58 @@ test('relay HTTP stream closes all pending responses on session close', () => {
   assert.deepEqual(first.jsonBody, { error: 'Relay HTTP session closed' });
   assert.equal(second.statusCode, 502);
   assert.deepEqual(second.jsonBody, { error: 'Relay HTTP session closed' });
+});
+
+test('relay HTTP stream bounds unread response buffers and cancels upstream once', () => {
+  const session: HttpRelayStreamSession = { pendingRequests: new Map() };
+  const response = new FakeResponse(false, false);
+  const cancellations: Array<{ requestId: string; reason: string }> = [];
+  const requestId = openPendingHttpRelayRequest(session, response, {
+    timeoutMs: 10_000,
+    maxBufferedBytes: 8,
+    createRequestId: () => 'request-bounded',
+    cancelUpstream: (id, reason) => cancellations.push({ requestId: id, reason }),
+  });
+  const pending = session.pendingRequests.get(requestId);
+  assert.ok(pending);
+
+  assert.deepEqual(writeRelayHttpResponseBody(pending, {
+    encoding: 'text',
+    data: '123456',
+  }), { ok: true, backpressured: true });
+  const overflow = writeRelayHttpResponseBody(pending, {
+    encoding: 'text',
+    data: '789',
+  });
+  assert.deepEqual(overflow, {
+    ok: false,
+    error: 'Relay HTTP response exceeded the bounded stream buffer',
+  });
+
+  if (!overflow.ok) {
+    cancelPendingHttpRelayRequest(session, requestId, overflow.error);
+    cancelPendingHttpRelayRequest(session, requestId, overflow.error);
+  }
+  assert.equal(session.pendingRequests.size, 0);
+  assert.deepEqual(cancellations, [{
+    requestId: 'request-bounded',
+    reason: 'Relay HTTP response exceeded the bounded stream buffer',
+  }]);
+  assert.equal(response.writableEnded, true);
+});
+
+test('relay HTTP stream cancels upstream when the downstream client disconnects', () => {
+  const session: HttpRelayStreamSession = { pendingRequests: new Map() };
+  const response = new FakeResponse();
+  const cancellations: string[] = [];
+  openPendingHttpRelayRequest(session, response, {
+    timeoutMs: 10_000,
+    createRequestId: () => 'request-disconnect',
+    cancelUpstream: (_id, reason) => cancellations.push(reason),
+  });
+
+  response.emitClose();
+
+  assert.equal(session.pendingRequests.size, 0);
+  assert.deepEqual(cancellations, ['Relay HTTP client disconnected']);
 });

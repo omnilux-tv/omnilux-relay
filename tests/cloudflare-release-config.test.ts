@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { test } from 'node:test';
 
 type WranglerConfig = {
@@ -17,10 +17,13 @@ const config = (path: string): WranglerConfig => JSON.parse(read(path)) as Wrang
 const routePatterns = (path: string): string[] =>
   (config(path).routes ?? []).flatMap((route) => route.pattern ? [route.pattern] : []);
 
-test('relay Worker release configs keep production routing isolated to the protected production config', () => {
+test('relay Worker release surface is staging-only while Node/VPS owns production', () => {
   assert.deepEqual(routePatterns('wrangler.jsonc'), []);
   assert.deepEqual(routePatterns('wrangler.staging.jsonc'), ['relay-test.omnilux.tv/*']);
-  assert.deepEqual(routePatterns('wrangler.production.jsonc'), ['relay.omnilux.tv/*']);
+  assert.equal(existsSync('wrangler.production.jsonc'), false);
+  assert.equal(existsSync('.github/workflows/cloudflare-worker-production.yml'), false);
+  assert.equal(config('wrangler.jsonc').vars?.RELAY_CONTROL_URL, 'https://api-test.omnilux.tv/functions/v1');
+  assert.equal(config('wrangler.jsonc').vars?.RELAY_GRANT_AUDIENCE, 'relay-test.omnilux.tv');
   assert.equal(
     config('wrangler.staging.jsonc').vars?.RELAY_CONTROL_URL,
     'https://api-test.omnilux.tv/functions/v1',
@@ -31,6 +34,12 @@ test('relay Worker release configs keep production routing isolated to the prote
   );
 
   const packageJson = JSON.parse(read('package.json')) as { scripts?: Record<string, string> };
+  assert.deepEqual(
+    Object.entries(packageJson.scripts ?? {}).filter(([name, command]) =>
+      name.includes('production') || command.includes('wrangler.production')
+    ),
+    [],
+  );
   assert.deepEqual(
     Object.entries(packageJson.scripts ?? {}).filter(([name, command]) =>
       name.startsWith('deploy:') || /wrangler deploy(?![^\n]*--dry-run)/.test(command)
@@ -55,26 +64,16 @@ test('relay Worker release configs keep production routing isolated to the prote
   assert.match(staging, /https:\/\/relay-test\.omnilux\.tv\/readyz/);
   assert.match(staging, /repository: omnilux-tv\/omnilux-packages\n\s+ref: [0-9a-f]{40}/);
 
-  const production = read('.github/workflows/cloudflare-worker-production.yml');
-  assert.match(production, /workflow_dispatch:/);
-  assert.doesNotMatch(production, /\n\s+push:/);
-  assert.match(production, /environment:\s*relay-production/);
-  assert.match(production, /release_sha:/);
-  assert.match(production, /staging_version_id:/);
-  assert.match(production, /rollback_version_id:/);
-  assert.match(production, /worker-staging-deployments-before\.json/);
-  assert.match(production, /wrangler deployments list/);
-  assert.match(production, /wrangler versions list/);
-  assert.match(production, /verify-worker-deployment-evidence\.mjs/);
-  assert.doesNotMatch(production, /grep -F/);
-  assert.match(production, /wrangler\.production\.jsonc/);
-  assert.match(production, /repository: omnilux-tv\/omnilux-packages\n\s+ref: [0-9a-f]{40}/);
-
-  for (const workflow of [validate, staging, production]) {
+  for (const workflow of [validate, staging]) {
     assert.doesNotMatch(workflow, /uses:\s+actions\/(?:checkout|setup-node|upload-artifact)@v\d/);
     assert.match(workflow, new RegExp(`actions/checkout@${checkoutSha}`));
     assert.match(workflow, new RegExp(`actions/setup-node@${setupNodeSha}`));
   }
   assert.match(staging, new RegExp(`actions/upload-artifact@${uploadArtifactSha}`));
-  assert.match(production, new RegExp(`actions/upload-artifact@${uploadArtifactSha}`));
+  for (const workflowPath of ['.github/workflows/ci.yml', '.github/workflows/docker-publish.yml']) {
+    assert.match(
+      read(workflowPath),
+      /repository: omnilux-tv\/omnilux-packages\n\s+ref: [0-9a-f]{40}/,
+    );
+  }
 });

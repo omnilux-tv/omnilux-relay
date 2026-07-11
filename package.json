@@ -13,7 +13,6 @@
     "build": "tsc -p tsconfig.json",
     "build:worker": "wrangler deploy --config wrangler.jsonc --dry-run",
     "build:worker:staging": "wrangler deploy --config wrangler.staging.jsonc --dry-run",
-    "build:worker:production": "wrangler deploy --config wrangler.production.jsonc --dry-run",
     "lint": "tsc -p tsconfig.json --noEmit",
     "lint:worker": "tsc -p tsconfig.cloudflare.json --noEmit",
     "start": "node dist/index.js",

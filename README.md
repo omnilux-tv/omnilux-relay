@@ -48,10 +48,10 @@ pnpm build
 
 ## Runtime contract
 
-This repo ships two relay runtimes:
+This repo contains one production relay runtime and one staging-only parity runtime:
 
-- `src/index.ts` is the Node/VPS relay runtime currently consumed by the public edge.
-- `src/cloudflare/index.ts` is the Cloudflare Worker + Durable Object relay runtime for the first global relay layer.
+- `src/index.ts` is the sole production Node/VPS relay runtime consumed by the public edge.
+- `src/cloudflare/index.ts` is a staging-only Cloudflare Worker + Durable Object parity runtime. It has no production route or promotion workflow.
 
 Both runtimes preserve the same tunnel/session protocol:
 
@@ -79,6 +79,8 @@ Both runtimes preserve the same tunnel/session protocol:
 - `RELAY_HTTP_REQUEST_BODY_MAX_BYTES` defaults to 25 MiB
 - `RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES` bounds unread streamed response data per
   request and defaults to 1 MiB
+- `RELAY_WEBSOCKET_MAX_PAYLOAD_BYTES` bounds every Node/VPS WebSocket message and
+  defaults to 1 MiB
 - `RELAY_RENDEZVOUS_TTL_MS` controls how long a server-to-shard route remains
   valid without registration or heartbeat refresh and defaults to two minutes
 
@@ -86,14 +88,15 @@ The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtim
 
 ## Cloudflare Worker relay
 
-Worker configuration is deliberately split by authority:
+Worker configuration is deliberately staging-only:
 
-- `wrangler.jsonc` is local and validation-only. It has no public route.
+- `wrangler.jsonc` is local and validation-only. It has no public route and uses
+  only the test control plane and test audience.
 - `wrangler.staging.jsonc` targets the isolated `relay-test.omnilux.tv/*` route
   and `api-test.omnilux.tv` control plane. Both must be provisioned in the
   non-production test lane before the manual staging workflow is enabled.
-- `wrangler.production.jsonc` is the only config allowed to contain
-  `relay.omnilux.tv/*`.
+- There is no Worker production config or production promotion workflow during
+  the focused household beta. `relay.omnilux.tv` remains on Node/VPS.
 
 ```bash
 pnpm test:release-config
@@ -101,23 +104,14 @@ pnpm lint:worker
 pnpm test:worker-smoke
 pnpm build:worker
 pnpm build:worker:staging
-pnpm build:worker:production
 ```
 
 Every build command above is a Wrangler dry-run and does not mutate Cloudflare
 state. There is intentionally no package-level deploy script. Pull requests and
 pushes to `main` run `.github/workflows/cloudflare-worker-validate.yml`, which
-validates all three configs without deploying. Staging and production promotion
-are separate, manual `workflow_dispatch` workflows.
-
-Production promotion requires a full immutable commit SHA, the exact staging
-Worker version ID carrying that SHA, an approved existing production rollback
-version ID, a change reference, and approval through the `relay-production`
-GitHub environment. Configure that environment with required reviewers and
-disallow self-review. The workflow verifies the staged SHA/version pair and the
-rollback version, captures deployment state before and after promotion, and
-rolls back if the production readiness probe fails. No push to `main` deploys
-production.
+validates local and staging configs without deploying. The only Worker deployment
+workflow is a manual `workflow_dispatch` to the isolated staging route. No push
+to `main` deploys a Worker.
 
 `pnpm test:worker-smoke` runs the Worker/Durable Object parity, load, reconnect,
 large-response, bounded-buffer, and cancellation checks locally. It does not
@@ -146,14 +140,13 @@ Runtime-specific differences:
   coordinator so the Node/VPS path and earlier Worker sessions remain rollback
   compatible during migration.
 
-Required Cloudflare secret in each GitHub deployment environment:
+Required Cloudflare secret in the staging GitHub deployment environment:
 
 ```bash
 pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.staging.jsonc
-pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.production.jsonc
 ```
 
-Required GitHub Actions secrets for the manual staging and production workflows:
+Required GitHub Actions secrets for the manual staging workflow:
 
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
@@ -178,10 +171,9 @@ existing session envelope:
 }
 ```
 
-The Node/VPS relay remains the live rollback path. A Worker release is not a
-Node image replacement: keep the reviewed Node image digest and edge routing
-available until Worker readiness, reconnect, large-response, and cancellation
-evidence has been accepted.
+The Node/VPS relay is the only live production path for the focused household
+beta. Worker staging evidence can inform a later architecture decision, but it
+does not authorize or imply a production cutover.
 
 Cloudflare TURN/WebRTC credentials are intentionally separate from this runtime.
 TURN is for NAT/firewall traversal on WebRTC-style paths, while this Worker
