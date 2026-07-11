@@ -48,7 +48,7 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           repository: omnilux-tv/omnilux-packages
-          ref: e4d6cb1de04acd4a40855de52ac7ec9dcc6e2d7d
+          ref: 4417465ef7068f0a4576f7028d277e5367388992
           path: shared/omnilux-packages
           ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
 
@@ -58,6 +58,7 @@ jobs:
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 22
+          package-manager-cache: false
 
       - name: Enable pnpm
         run: corepack enable
