@@ -22,10 +22,17 @@ export type RelayHeartbeatResult = {
 export type ConsumedRelaySession = {
   sessionId: string;
   serverId: string;
+  connectionId: string;
+  attachAttemptId: string;
   userId?: string;
   sessionType: string;
   expiresAt?: string;
   metadata?: Record<string, unknown>;
+};
+
+export type ConsumeRelaySessionRequest = {
+  connectionId: string;
+  attachAttemptId: string;
 };
 
 export type RelayControlPlaneClient = {
@@ -39,7 +46,7 @@ export type RelayControlPlaneClient = {
   ) => Promise<RelayControlPlaneResult<RelayHeartbeatResult>>;
   consumeRelaySession: (
     token: string,
-    body: JsonRecord
+    body: ConsumeRelaySessionRequest
   ) => Promise<RelayControlPlaneResult<ConsumedRelaySession>>;
 };
 

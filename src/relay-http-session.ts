@@ -32,8 +32,12 @@ export function createRelayHttpSessionStore(): RelayHttpSessionStore {
       sessionsById.set(session.sessionId, session);
     },
     remove(session) {
-      sessionsByHandle.delete(session.handle);
-      sessionsById.delete(session.sessionId);
+      if (sessionsByHandle.get(session.handle) === session) {
+        sessionsByHandle.delete(session.handle);
+      }
+      if (sessionsById.get(session.sessionId) === session) {
+        sessionsById.delete(session.sessionId);
+      }
     },
     getByHandle(handle) {
       return sessionsByHandle.get(handle);

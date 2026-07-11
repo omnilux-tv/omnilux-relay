@@ -1,4 +1,3 @@
-import crypto from 'node:crypto';
 import {
   classifyRelayCondition,
   type RelayConditionResult,
@@ -12,6 +11,10 @@ import {
   type RelayGrant,
   type RelayGrantVerificationResult,
 } from './relay-grant-verification.js';
+import {
+  deriveRelayAttachAttemptId,
+  deriveRelaySessionConnectionId,
+} from './relay-attach-attempt.js';
 import type {
   RelayTunnelRegistry,
   TunnelConnection,
@@ -51,7 +54,6 @@ export type AttachRelaySessionInput = {
   relayControlPlane: RelayControlPlaneClient;
   tunnelRegistry: RelayTunnelRegistry;
   verifyGrantToken: (token: string) => Promise<RelayGrantVerificationResult>;
-  createConnectionId?: () => string;
 };
 
 const purposeFailureDetail: Record<RelaySessionAttachmentPurpose, string> = {
@@ -62,7 +64,10 @@ const purposeFailureDetail: Record<RelaySessionAttachmentPurpose, string> = {
 export async function attachRelaySession(
   input: AttachRelaySessionInput,
 ): Promise<RelaySessionAttachmentResult> {
-  const connectionId = input.createConnectionId?.() ?? crypto.randomUUID();
+  const [connectionId, attachAttemptId] = await Promise.all([
+    deriveRelaySessionConnectionId(input.token),
+    deriveRelayAttachAttemptId(input.token),
+  ]);
   const grantVerification = await input.verifyGrantToken(input.token);
 
   if (!grantVerification.ok) {
@@ -89,7 +94,27 @@ export async function attachRelaySession(
     };
   }
 
-  const response = await input.relayControlPlane.consumeRelaySession(input.token, { connectionId });
+  const expectedTunnel = grant
+    ? input.tunnelRegistry.getByServerId(grant.serverId)
+    : undefined;
+  if (grant && !expectedTunnel) {
+    return {
+      ok: false,
+      connectionId,
+      stage: 'tunnel',
+      grant,
+      condition: classifyRelayCondition({
+        source: 'session-attach',
+        hasActiveTunnel: false,
+        error: 'No active relay tunnel for this server',
+      }),
+    };
+  }
+
+  const response = await input.relayControlPlane.consumeRelaySession(input.token, {
+    connectionId,
+    attachAttemptId,
+  });
   if (!response.ok) {
     const condition = classifyRelayCondition({
       source: 'session-attach',
@@ -107,6 +132,23 @@ export async function attachRelaySession(
     };
   }
 
+  if (
+    response.data.connectionId !== connectionId
+    || response.data.attachAttemptId !== attachAttemptId
+  ) {
+    return {
+      ok: false,
+      connectionId,
+      stage: 'binding',
+      grant,
+      condition: {
+        relayCondition: 'unauthorized',
+        reasonCode: 'auth_invalid',
+        detail: 'Relay consume response does not match the attach attempt',
+      },
+    };
+  }
+
   if (grant) {
     const bindingCondition = validateRelayGrantSessionBinding(grant, response.data);
     if (bindingCondition) {
@@ -120,7 +162,9 @@ export async function attachRelaySession(
     }
   }
 
-  const tunnel = input.tunnelRegistry.getByServerId(response.data.serverId);
+  const tunnel = expectedTunnel
+    ? input.tunnelRegistry.getByConnectionId(expectedTunnel.connectionId)
+    : input.tunnelRegistry.getByServerId(response.data.serverId);
   if (!tunnel) {
     return {
       ok: false,
@@ -131,6 +175,24 @@ export async function attachRelaySession(
         source: 'session-attach',
         hasActiveTunnel: false,
         error: 'No active relay tunnel for this server',
+      }),
+    };
+  }
+  if (
+    tunnel.serverId !== response.data.serverId
+    || (expectedTunnel
+      && input.tunnelRegistry.getByServerId(response.data.serverId)?.connectionId
+        !== expectedTunnel.connectionId)
+  ) {
+    return {
+      ok: false,
+      connectionId,
+      stage: 'tunnel',
+      grant,
+      condition: classifyRelayCondition({
+        source: 'session-attach',
+        hasActiveTunnel: false,
+        error: 'Relay tunnel changed while the session was attaching',
       }),
     };
   }

@@ -58,6 +58,10 @@ Both runtimes preserve the same tunnel/session protocol:
 - self-hosted servers connect to `/ws/server` and register a tunnel with a relay tunnel token
 - cloud-created browser/client sessions connect through `/ws/session` or `/r/<relay-session-token>/`
 - relay sessions are consumed through `omnilux-cloud`
+- each consume includes a token-derived, domain-separated `attachAttemptId`;
+  its logical `connectionId` is independently derived from the same token, so
+  retries reuse both identifiers and delayed requests cannot overwrite newer
+  state or irreversibly burn a one-time grant
 - active server tunnels receive `session-open`, `session-frame`, and `session-close`
 - browser HTTP relay traffic is forwarded as `http-request` frames and returned as `http-response-*` frames
 
@@ -73,51 +77,111 @@ Both runtimes preserve the same tunnel/session protocol:
 - `RELAY_HTTP_SESSION_TTL_MS` defaults to four hours
 - `RELAY_HTTP_REQUEST_TIMEOUT_MS` defaults to ten minutes
 - `RELAY_HTTP_REQUEST_BODY_MAX_BYTES` defaults to 25 MiB
+- `RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES` bounds unread streamed response data per
+  request and defaults to 1 MiB
+- `RELAY_RENDEZVOUS_TTL_MS` controls how long a server-to-shard route remains
+  valid without registration or heartbeat refresh and defaults to two minutes
 
 The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
 
 ## Cloudflare Worker relay
 
-The Worker deploy target is configured in `wrangler.jsonc`.
+Worker configuration is deliberately split by authority:
+
+- `wrangler.jsonc` is local and validation-only. It has no public route.
+- `wrangler.staging.jsonc` targets the isolated `relay-test.omnilux.tv/*` route
+  and `api-test.omnilux.tv` control plane. Both must be provisioned in the
+  non-production test lane before the manual staging workflow is enabled.
+- `wrangler.production.jsonc` is the only config allowed to contain
+  `relay.omnilux.tv/*`.
 
 ```bash
+pnpm test:release-config
 pnpm lint:worker
 pnpm test:worker-smoke
 pnpm build:worker
-pnpm deploy:worker
+pnpm build:worker:staging
+pnpm build:worker:production
 ```
 
-`pnpm test:worker-smoke` runs the Worker/Durable Object parity smoke locally through Wrangler dev. It does not mutate production Cloudflare state. The smoke covers `/readyz`, tunnel registration, signed session attach, signed-grant purpose rejection, browser HTTP relay handoff, and fail-closed behavior when signed-grant verification keys are missing or invalid.
+Every build command above is a Wrangler dry-run and does not mutate Cloudflare
+state. There is intentionally no package-level deploy script. Pull requests and
+pushes to `main` run `.github/workflows/cloudflare-worker-validate.yml`, which
+validates all three configs without deploying. Staging and production promotion
+are separate, manual `workflow_dispatch` workflows.
+
+Production promotion requires a full immutable commit SHA, the exact staging
+Worker version ID carrying that SHA, an approved existing production rollback
+version ID, a change reference, and approval through the `relay-production`
+GitHub environment. Configure that environment with required reviewers and
+disallow self-review. The workflow verifies the staged SHA/version pair and the
+rollback version, captures deployment state before and after promotion, and
+rolls back if the production readiness probe fails. No push to `main` deploys
+production.
+
+`pnpm test:worker-smoke` runs the Worker/Durable Object parity, load, reconnect,
+large-response, bounded-buffer, and cancellation checks locally. It does not
+mutate production Cloudflare state. `/readyz` fails closed unless the signed-grant
+key is configured and both the coordinator and rendezvous Durable Objects answer
+their internal probes.
 
 Guaranteed parity with the Node/VPS relay:
 
 - Both runtimes require signed relay grants by default and consume sessions through `omnilux-cloud`.
+- Both runtimes preflight and postcheck the exact live tunnel around consume,
+  reject mismatched consume-response attempt bindings, and supersede any prior
+  local socket/session returned by an idempotent same-token retry.
 - Both runtimes register server tunnels, emit `session-open`, forward WebSocket frames, and proxy browser HTTP traffic as `http-request` / `http-response-*` frames.
 - Both runtimes strip relay control cookies before origin forwarding and prevent tunneled origins from replacing the relay session cookie.
 
 Runtime-specific differences:
 
 - The Node/VPS relay owns the container image consumed by `omnilux-edge` and runs Express + `ws`.
-- The Cloudflare relay uses a Worker front door plus a single named Durable Object coordinator. It is currently a parity target for global relay layering and should remain covered by local Wrangler smoke before deployment.
+- The Cloudflare relay uses a Worker front door, sharded coordinator Durable
+  Objects, and a rendezvous Durable Object. A tunnel is placed on a deterministic
+  token shard before registration; registration publishes the authoritative
+  server-to-shard route. Session grants and HTTP route cookies resolve that route,
+  and reconnecting on another shard safely supersedes the prior tunnel.
+- Legacy cookies and routes can still fall back to the configured legacy
+  coordinator so the Node/VPS path and earlier Worker sessions remain rollback
+  compatible during migration.
 
-Required Cloudflare secret:
+Required Cloudflare secret in each GitHub deployment environment:
 
 ```bash
-pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.jsonc
+pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.staging.jsonc
+pnpm wrangler secret put RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL --config wrangler.production.jsonc
 ```
 
-Required GitHub Actions secrets for `.github/workflows/cloudflare-worker-deploy.yml`:
+Required GitHub Actions secrets for the manual staging and production workflows:
 
 - `CLOUDFLARE_API_TOKEN`
 - `CLOUDFLARE_ACCOUNT_ID`
 - `OMNILUX_PACKAGES_DEPLOY_KEY`
 
-The Durable Object binding is `RELAY_COORDINATOR`. The first deployment uses one
-named coordinator object (`RELAY_COORDINATOR_NAME=global`) so server tunnels and
-session attachment meet in the same hibernation-aware coordination point. This
-is the first production-shaped Cloudflare relay layer; future sharding should
-route by a stable server key once tunnel URLs or control-plane rendezvous carry
-that key before registration.
+The Durable Object bindings are `RELAY_COORDINATOR` and `RELAY_RENDEZVOUS`.
+`RELAY_LEGACY_COORDINATOR_NAME` controls only the compatibility fallback; normal
+traffic uses the rendezvous directory and route-bearing session cookie.
+
+HTTP responses are exposed as streams at `http-response-start`; body frames are
+not accumulated until `http-response-end`. The per-request bound applies
+backpressure and cancels the upstream runtime fetch when the client stops reading,
+times out, or exceeds the unread-buffer limit. Cancellation is sent inside the
+existing session envelope:
+
+```json
+{
+  "type": "session-frame",
+  "sessionId": "session-id",
+  "encoding": "text",
+  "data": "{\"type\":\"http-request-cancel\",\"requestId\":\"request-id\",\"reason\":\"...\"}"
+}
+```
+
+The Node/VPS relay remains the live rollback path. A Worker release is not a
+Node image replacement: keep the reviewed Node image digest and edge routing
+available until Worker readiness, reconnect, large-response, and cancellation
+evidence has been accepted.
 
 Cloudflare TURN/WebRTC credentials are intentionally separate from this runtime.
 TURN is for NAT/firewall traversal on WebRTC-style paths, while this Worker

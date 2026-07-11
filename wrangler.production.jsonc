@@ -1,13 +1,18 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "omnilux-relay-local",
+  "name": "omnilux-relay",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-06-28",
+  "workers_dev": false,
   "observability": {
     "enabled": true
   },
-  "workers_dev": false,
-  "routes": [],
+  "routes": [
+    {
+      "pattern": "relay.omnilux.tv/*",
+      "zone_name": "omnilux.tv"
+    }
+  ],
   "vars": {
     "RELAY_CONTROL_URL": "https://api.omnilux.tv/functions/v1",
     "RELAY_GRANT_AUDIENCE": "relay.omnilux.tv",

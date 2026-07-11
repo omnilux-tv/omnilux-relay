@@ -12,6 +12,12 @@ import {
   type RelayControlPlaneClient,
 } from '../relay-control-plane.js';
 import {
+  deriveRelayAttachAttemptId,
+  deriveRelaySessionConnectionId,
+} from '../relay-attach-attempt.js';
+import {
+  parseSignedRelayGrantToken,
+  validateRelayGrantPublicKey,
   validateRelayGrantSessionBinding,
   verifyRelayGrantToken,
   type RelayGrant,
@@ -20,7 +26,11 @@ import {
 
 export interface Env {
   RELAY_COORDINATOR: DurableObjectNamespace;
-  RELAY_COORDINATOR_NAME?: string;
+  RELAY_RENDEZVOUS: DurableObjectNamespace;
+  RELAY_LEGACY_COORDINATOR_NAME?: string;
+  RELAY_RENDEZVOUS_NAME?: string;
+  RELAY_RENDEZVOUS_PARTITIONS?: string;
+  RELAY_RENDEZVOUS_TTL_MS?: string;
   RELAY_CONTROL_URL?: string;
   RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL?: string;
   RELAY_GRANT_AUDIENCE?: string;
@@ -31,6 +41,7 @@ export interface Env {
   RELAY_HTTP_SESSION_TTL_MS?: string;
   RELAY_HTTP_REQUEST_TIMEOUT_MS?: string;
   RELAY_HTTP_REQUEST_BODY_MAX_BYTES?: string;
+  RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES?: string;
   RELAY_HTTP_COOKIE_SECURE?: string;
   RELAY_REGION?: string;
 }
@@ -68,6 +79,8 @@ interface TunnelAttachment {
   region?: string;
   clientVersion?: string;
   capabilities?: JsonRecord;
+  shardKey: string;
+  acceptedAt?: number;
 }
 
 interface ClientSessionAttachment {
@@ -106,30 +119,61 @@ interface HttpRelaySessionRecord {
   openedAt: string;
   lastSeenAt: string;
   expiresAt: number;
+  shardKey: string;
+}
+
+interface ServerRouteRecord {
+  serverId: string;
+  shardKey: string;
+  connectionId: string;
+  acceptedAt: number;
+  updatedAt: number;
+  expiresAt: number;
 }
 
 interface PendingHttpRequest {
   sessionId: string;
   tunnelConnectionId: string;
+  requestMethod: string;
   status: number;
   headers: Headers;
-  chunks: Uint8Array[];
+  stream: TransformStream<Uint8Array, Uint8Array>;
+  writer: WritableStreamDefaultWriter<Uint8Array>;
+  started: boolean;
+  queuedBytes: number;
+  writeChain: Promise<void>;
+  maxBufferedBytes: number;
   timeout: ReturnType<typeof setTimeout>;
   resolve: (response: Response) => void;
+  abortSignal: AbortSignal;
+  abortListener: () => void;
 }
 
 const DEFAULT_CONTROL_URL = 'https://api.omnilux.tv/functions/v1';
 const DEFAULT_AUDIENCE = 'relay.omnilux.tv';
-const DEFAULT_COORDINATOR_NAME = 'global';
+const DEFAULT_LEGACY_COORDINATOR_NAME = 'global';
+const DEFAULT_RENDEZVOUS_NAME = 'relay-rendezvous-v1';
+const DEFAULT_RENDEZVOUS_PARTITIONS = 64;
 const DEFAULT_COOKIE_NAME = 'omnilux_relay_session';
 const DEFAULT_GRANT_MAX_CLOCK_SKEW_MS = 30_000;
 const DEFAULT_GRANT_MAX_TTL_MS = 5 * 60 * 1000;
 const DEFAULT_HTTP_SESSION_TTL_MS = 4 * 60 * 60 * 1000;
 const DEFAULT_HTTP_REQUEST_TIMEOUT_MS = 10 * 60 * 1000;
 const DEFAULT_HTTP_REQUEST_BODY_MAX_BYTES = 25 * 1024 * 1024;
+const DEFAULT_HTTP_RESPONSE_BUFFER_MAX_BYTES = 1024 * 1024;
+const DEFAULT_RENDEZVOUS_TTL_MS = 2 * 60 * 1000;
 const HTTP_SESSION_PREFIX = 'http-session:';
 const HTTP_SESSION_BY_ID_PREFIX = 'http-session-by-id:';
+const SERVER_ROUTE_PREFIX = 'server-route:';
 const WS_OPEN = 1;
+const INTERNAL_CONTROL_PATH_PREFIX = '/_relay-internal/';
+const INTERNAL_CONTROL_HEADER = 'X-OmniLux-Relay-Internal';
+const INTERNAL_CONTROL_VALUE = 'relay-worker-internal-v1';
+const INTERNAL_SHARD_HEADER = 'X-OmniLux-Relay-Shard';
+const INTERNAL_HTTP_REQUEST_HEADER = 'X-OmniLux-Relay-Request-Id';
+const ROUTE_COOKIE_VERSION = 'v1';
+
+class RelayRequestBodyTooLargeError extends Error {}
 
 const HOP_BY_HOP_HEADERS = new Set([
   'connection',
@@ -159,22 +203,39 @@ const worker = {
     }
 
     if (upgrade !== 'websocket' && url.pathname === '/readyz') {
-      const signedGrantsRequired = env.RELAY_ALLOW_LEGACY_SESSION_GRANTS !== 'true';
-      const keyConfigured = Boolean(env.RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL?.trim());
-      return jsonResponse(
-        {
-          ok: !signedGrantsRequired || keyConfigured,
-          runtime: 'cloudflare-worker',
-          durableObjectBinding: Boolean(env.RELAY_COORDINATOR),
-          signedRelayGrantVerification: signedGrantsRequired ? 'required' : 'legacy-compatible',
-        },
-        { status: signedGrantsRequired && !keyConfigured ? 503 : 200 },
-      );
+      return workerReadinessResponse(env);
     }
 
-    const coordinatorName = env.RELAY_COORDINATOR_NAME?.trim() || DEFAULT_COORDINATOR_NAME;
-    const id = env.RELAY_COORDINATOR.idFromName(coordinatorName);
-    return env.RELAY_COORDINATOR.get(id).fetch(request);
+    if (url.pathname.startsWith(INTERNAL_CONTROL_PATH_PREFIX)) {
+      return jsonResponse({ error: 'Not found' }, { status: 404 });
+    }
+
+    const requestBodyLimit = envNumber(
+      env.RELAY_HTTP_REQUEST_BODY_MAX_BYTES,
+      DEFAULT_HTTP_REQUEST_BODY_MAX_BYTES,
+    );
+    if (declaredRequestBodyTooLarge(request, requestBodyLimit)) {
+      await request.body?.cancel('Relay HTTP request body is too large').catch(() => undefined);
+      return jsonResponse({ error: 'Relay HTTP request body is too large' }, { status: 413 });
+    }
+
+    const shardKey = await shardKeyForPublicRequest(request, env);
+    if (!shardKey) {
+      return jsonResponse(
+        { error: 'Relay server route is unavailable' },
+        { status: 503 },
+      );
+    }
+    let response: Response;
+    try {
+      response = await fetchCoordinator(env, shardKey, request);
+    } catch (error) {
+      if (error instanceof RelayRequestBodyTooLargeError) {
+        return jsonResponse({ error: error.message }, { status: 413 });
+      }
+      throw error;
+    }
+    return exposeCoordinatorResponse(env, shardKey, response, request.signal);
   },
 };
 
@@ -192,6 +253,49 @@ export class RelayCoordinator {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const upgrade = request.headers.get('Upgrade')?.toLowerCase() ?? '';
+
+    if (url.pathname === `${INTERNAL_CONTROL_PATH_PREFIX}readyz`) {
+      if (!isInternalControlRequest(request)) {
+        return jsonResponse({ error: 'Not found' }, { status: 404 });
+      }
+      const activeTunnels = this.state.getWebSockets('role:tunnel')
+        .filter((socket) => isRegisteredTunnelAttachment(getSocketAttachment(socket))).length;
+      return jsonResponse({ ok: true, activeTunnels });
+    }
+
+    if (url.pathname === `${INTERNAL_CONTROL_PATH_PREFIX}supersede` && request.method === 'POST') {
+      if (!isInternalControlRequest(request)) {
+        return jsonResponse({ error: 'Not found' }, { status: 404 });
+      }
+      const body = await request.json().catch(() => null) as JsonRecord | null;
+      const connectionId = typeof body?.connectionId === 'string' ? body.connectionId : '';
+      if (!connectionId) return jsonResponse({ error: 'connectionId is required' }, { status: 400 });
+      const tunnel = this.findTunnelByConnectionId(connectionId);
+      if (tunnel) {
+        const condition: RelayConditionResult = {
+          relayCondition: 'degraded',
+          reasonCode: 'control_plane_error',
+          detail: 'Superseded by a newer tunnel',
+        };
+        await this.closeTunnelSessions(connectionId, condition.detail, condition);
+        closeSocket(tunnel.socket, 1012, toCloseReason(condition, condition.detail));
+      }
+      return jsonResponse({ ok: true });
+    }
+
+    if (url.pathname === `${INTERNAL_CONTROL_PATH_PREFIX}http-cancel` && request.method === 'POST') {
+      if (!isInternalControlRequest(request)) {
+        return jsonResponse({ error: 'Not found' }, { status: 404 });
+      }
+      const body = await request.json().catch(() => null) as JsonRecord | null;
+      const requestId = typeof body?.requestId === 'string' ? body.requestId : '';
+      const reason = typeof body?.reason === 'string' && body.reason
+        ? body.reason
+        : 'Relay HTTP response consumer cancelled';
+      if (!requestId) return jsonResponse({ error: 'requestId is required' }, { status: 400 });
+      await this.cancelPendingHttpRequest(requestId, reason);
+      return jsonResponse({ ok: true });
+    }
 
     if (upgrade === 'websocket') {
       if (url.pathname === '/ws/server') return this.acceptTunnelWebSocket(request);
@@ -235,6 +339,9 @@ export class RelayCoordinator {
     if (!attachment) return;
 
     if (attachment.role === 'tunnel' && attachment.registered && attachment.connectionId) {
+      if (attachment.serverId) {
+        await deleteServerShard(this.env, attachment.serverId, attachment.connectionId);
+      }
       const condition = classifyRelayCondition({
         source: 'close',
         code,
@@ -268,6 +375,9 @@ export class RelayCoordinator {
     });
 
     if (attachment?.role === 'tunnel' && attachment.registered && attachment.connectionId) {
+      if (attachment.serverId) {
+        await deleteServerShard(this.env, attachment.serverId, attachment.connectionId);
+      }
       await this.closeTunnelSessions(attachment.connectionId, condition.detail, condition);
     } else if (attachment?.role === 'session' && !attachment.closedByRelay) {
       this.notifyTunnelSessionClose(attachment, condition.detail, condition);
@@ -286,6 +396,10 @@ export class RelayCoordinator {
       role: 'tunnel',
       token,
       registered: false,
+      acceptedAt: Date.now(),
+      shardKey: request.headers.get(INTERNAL_SHARD_HEADER)
+        || this.env.RELAY_LEGACY_COORDINATOR_NAME?.trim()
+        || DEFAULT_LEGACY_COORDINATOR_NAME,
     };
 
     this.state.acceptWebSocket(server, ['role:tunnel']);
@@ -307,6 +421,13 @@ export class RelayCoordinator {
     if (!attachment.ok) {
       return this.relayAttachmentFailureResponse(attachment);
     }
+
+    await this.closeSessionById(
+      attachment.consumedSession.sessionId,
+      1012,
+      'Superseded by an idempotent relay attach retry',
+      relayAttachSupersededCondition(),
+    );
 
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
@@ -364,6 +485,10 @@ export class RelayCoordinator {
     }
 
     if (payload.type === 'register') {
+      if (attachment.role === 'tunnel' && attachment.registered) {
+        sendJson(socket, { type: 'error', code: 'ALREADY_REGISTERED', message: 'Tunnel is already registered' });
+        return;
+      }
       await this.registerTunnel(socket, attachment, payload);
       return;
     }
@@ -390,13 +515,13 @@ export class RelayCoordinator {
         this.handleHttpResponseStart(payload, registeredAttachment);
         break;
       case 'http-response-body':
-        this.handleHttpResponseBody(payload, registeredAttachment);
+        await this.handleHttpResponseBody(payload, registeredAttachment);
         break;
       case 'http-response-end':
-        this.handleHttpResponseEnd(payload, registeredAttachment);
+        await this.handleHttpResponseEnd(payload, registeredAttachment);
         break;
       case 'http-response-error':
-        this.handleHttpResponseError(payload, registeredAttachment);
+        await this.handleHttpResponseError(payload, registeredAttachment);
         break;
       default:
         sendJson(socket, {
@@ -507,15 +632,46 @@ export class RelayCoordinator {
       registered: true,
       serverId: response.data.serverId,
       connectionId,
-      registeredAt: new Date().toISOString(),
+      registeredAt: new Date(attachment.acceptedAt ?? Date.now()).toISOString(),
       protocolVersion,
       region: typeof payload.region === 'string' ? payload.region : this.env.RELAY_REGION,
       clientVersion: typeof payload.clientVersion === 'string' ? payload.clientVersion : undefined,
       capabilities: isJsonObject(payload.capabilities) ? payload.capabilities : undefined,
+      shardKey: attachment.shardKey,
     };
 
     await this.supersedeExistingTunnel(registeredAttachment.serverId, connectionId);
     socket.serializeAttachment(registeredAttachment);
+    let routeRegistration: Awaited<ReturnType<typeof registerServerShard>>;
+    try {
+      routeRegistration = await registerServerShard(
+        this.env,
+        registeredAttachment.serverId,
+        registeredAttachment.shardKey,
+        connectionId,
+        attachment.acceptedAt ?? Date.now(),
+      );
+      if (!routeRegistration.published) {
+        socket.serializeAttachment(attachment);
+        closeSocket(socket, 1012, 'Superseded by a newer tunnel');
+        return;
+      }
+      const previousRoute = routeRegistration.previous;
+      if (
+        previousRoute
+        && previousRoute.connectionId !== connectionId
+        && previousRoute.shardKey !== registeredAttachment.shardKey
+      ) {
+        await this.supersedeRemoteTunnel(previousRoute);
+      }
+    } catch (error) {
+      await deleteServerShard(this.env, registeredAttachment.serverId, connectionId);
+      socket.serializeAttachment(attachment);
+      const message = error instanceof Error ? error.message : 'Relay rendezvous registration failed';
+      sendJson(socket, { type: 'error', code: 'RENDEZVOUS_FAILED', message });
+      closeSocket(socket, 1011, message);
+      return;
+    }
 
     sendJson(socket, {
       type: 'registered',
@@ -523,6 +679,8 @@ export class RelayCoordinator {
       connectionId,
       heartbeatIntervalSeconds: response.data.heartbeatIntervalSeconds,
       relaySessionTtlSeconds: response.data.relaySessionTtlSeconds,
+      relayShard: registeredAttachment.shardKey,
+      relayRendezvousPartition: routeRegistration.partition,
     });
 
     relayLog('relay tunnel registered', {
@@ -539,6 +697,17 @@ export class RelayCoordinator {
     tunnel: RegisteredTunnelAttachment,
     payload: JsonRecord,
   ): Promise<void> {
+    const routeTouch = await touchServerShard(
+      this.env,
+      tunnel.serverId,
+      tunnel.shardKey,
+      tunnel.connectionId,
+      Date.parse(tunnel.registeredAt ?? ''),
+    );
+    if (routeTouch === 'superseded') {
+      closeSocket(socket, 1012, 'Superseded by a newer tunnel');
+      return;
+    }
     const outgoingCondition: RelayConditionResult = {
       relayCondition: 'connected',
       reasonCode: 'ok',
@@ -612,7 +781,10 @@ export class RelayCoordinator {
     token: string,
     purpose: RelaySessionAttachmentPurpose,
   ): Promise<RelaySessionAttachmentResult> {
-    const connectionId = crypto.randomUUID();
+    const [connectionId, attachAttemptId] = await Promise.all([
+      deriveRelaySessionConnectionId(token),
+      deriveRelayAttachAttemptId(token),
+    ]);
     const grantVerification = await this.verifyRelayGrantToken(token);
 
     if (!grantVerification.ok) {
@@ -639,7 +811,32 @@ export class RelayCoordinator {
       };
     }
 
-    const response = await this.controlPlane().consumeRelaySession(token, { connectionId });
+    // A signed one-time grant must never be consumed on the strength of a
+    // rendezvous record alone. Routes can expire or briefly outlive a socket
+    // close, so confirm that this coordinator owns the exact live route before
+    // making the control-plane consume call.
+    const expectedTunnel = grant ? this.findTunnelByServerId(grant.serverId) : null;
+    if (grant && (
+      !expectedTunnel
+      || !await tunnelOwnsAuthoritativeRoute(this.env, expectedTunnel)
+    )) {
+      return {
+        ok: false,
+        connectionId,
+        stage: 'tunnel',
+        grant,
+        condition: classifyRelayCondition({
+          source: 'session-attach',
+          hasActiveTunnel: false,
+          error: 'No active relay tunnel for this server',
+        }),
+      };
+    }
+
+    const response = await this.controlPlane().consumeRelaySession(token, {
+      connectionId,
+      attachAttemptId,
+    });
     if (!response.ok) {
       const condition = classifyRelayCondition({
         source: 'session-attach',
@@ -657,6 +854,23 @@ export class RelayCoordinator {
       };
     }
 
+    if (
+      response.data.connectionId !== connectionId
+      || response.data.attachAttemptId !== attachAttemptId
+    ) {
+      return {
+        ok: false,
+        connectionId,
+        stage: 'binding',
+        grant,
+        condition: {
+          relayCondition: 'unauthorized',
+          reasonCode: 'auth_invalid',
+          detail: 'Relay consume response does not match the attach attempt',
+        },
+      };
+    }
+
     if (grant) {
       const bindingCondition = validateRelayGrantSessionBinding(grant, response.data);
       if (bindingCondition) {
@@ -670,7 +884,9 @@ export class RelayCoordinator {
       }
     }
 
-    const tunnel = this.findTunnelByServerId(response.data.serverId);
+    const tunnel = expectedTunnel
+      ? this.findTunnelByConnectionId(expectedTunnel.attachment.connectionId)
+      : this.findTunnelByServerId(response.data.serverId);
     if (!tunnel) {
       return {
         ok: false,
@@ -681,6 +897,22 @@ export class RelayCoordinator {
           source: 'session-attach',
           hasActiveTunnel: false,
           error: 'No active relay tunnel for this server',
+        }),
+      };
+    }
+    if (
+      tunnel.attachment.serverId !== response.data.serverId
+      || (grant && !await tunnelOwnsAuthoritativeRoute(this.env, tunnel))
+    ) {
+      return {
+        ok: false,
+        connectionId,
+        stage: 'tunnel',
+        grant,
+        condition: classifyRelayCondition({
+          source: 'session-attach',
+          hasActiveTunnel: false,
+          error: 'Relay tunnel changed while the session was attaching',
         }),
       };
     }
@@ -713,6 +945,13 @@ export class RelayCoordinator {
       return this.relayAttachmentFailureResponse(attachment);
     }
 
+    await this.closeSessionById(
+      attachment.consumedSession.sessionId,
+      1012,
+      'Superseded by an idempotent relay attach retry',
+      relayAttachSupersededCondition(),
+    );
+
     const now = new Date();
     const ttlMs = envNumber(this.env.RELAY_HTTP_SESSION_TTL_MS, DEFAULT_HTTP_SESSION_TTL_MS);
     const handle = crypto.randomUUID();
@@ -727,6 +966,9 @@ export class RelayCoordinator {
       openedAt: now.toISOString(),
       lastSeenAt: now.toISOString(),
       expiresAt,
+      shardKey: request.headers.get(INTERNAL_SHARD_HEADER)
+        || this.env.RELAY_LEGACY_COORDINATOR_NAME?.trim()
+        || DEFAULT_LEGACY_COORDINATOR_NAME,
     };
 
     await this.putHttpSession(record);
@@ -748,7 +990,7 @@ export class RelayCoordinator {
       Location: target || '/',
       'Set-Cookie': relaySessionCookie({
         cookieName: this.httpSessionCookieName(),
-        handle,
+        handle: encodeRelayRouteCookie(record.shardKey, handle),
         maxAgeSeconds: relaySessionMaxAgeSeconds(expiresAt),
         secure: this.secureCookies(),
       }),
@@ -781,7 +1023,7 @@ export class RelayCoordinator {
     }
 
     const requestId = crypto.randomUUID();
-    const pending = this.openPendingHttpRequest(requestId, session);
+    const pending = this.openPendingHttpRequest(requestId, session, request);
 
     try {
       const body = await readRequestBody(request, envNumber(
@@ -812,62 +1054,142 @@ export class RelayCoordinator {
     return pending;
   }
 
-  private openPendingHttpRequest(requestId: string, session: HttpRelaySessionRecord): Promise<Response> {
+  private openPendingHttpRequest(
+    requestId: string,
+    session: HttpRelaySessionRecord,
+    request: Request,
+  ): Promise<Response> {
     let resolveResponse: (response: Response) => void = () => undefined;
     const responsePromise = new Promise<Response>((resolve) => {
       resolveResponse = resolve;
     });
+    const maxBufferedBytes = Math.max(1, envNumber(
+      this.env.RELAY_HTTP_RESPONSE_BUFFER_MAX_BYTES,
+      DEFAULT_HTTP_RESPONSE_BUFFER_MAX_BYTES,
+    ));
+    const strategy = new ByteLengthQueuingStrategy({ highWaterMark: maxBufferedBytes });
+    const stream = new TransformStream<Uint8Array, Uint8Array>(undefined, strategy, strategy);
+    const writer = stream.writable.getWriter();
+    const abortListener = () => {
+      void this.cancelPendingHttpRequest(requestId, 'Relay HTTP client disconnected');
+    };
     const timeout = setTimeout(() => {
-      this.resolvePendingHttpRequest(requestId, jsonResponse(
-        { error: 'Relay HTTP request timed out' },
-        { status: 504 },
-      ));
+      void this.cancelPendingHttpRequest(
+        requestId,
+        'Relay HTTP request timed out',
+        504,
+      );
     }, envNumber(this.env.RELAY_HTTP_REQUEST_TIMEOUT_MS, DEFAULT_HTTP_REQUEST_TIMEOUT_MS));
 
-    this.pendingHttpRequests.set(requestId, {
+    const pending: PendingHttpRequest = {
       sessionId: session.sessionId,
       tunnelConnectionId: session.tunnelConnectionId,
+      requestMethod: request.method,
       status: 200,
       headers: new Headers({ 'Cache-Control': 'private, no-store' }),
-      chunks: [],
+      stream,
+      writer,
+      started: false,
+      queuedBytes: 0,
+      writeChain: Promise.resolve(),
+      maxBufferedBytes,
       timeout,
       resolve: resolveResponse,
+      abortSignal: request.signal,
+      abortListener,
+    };
+    this.pendingHttpRequests.set(requestId, pending);
+    request.signal.addEventListener('abort', abortListener, { once: true });
+    void writer.closed.catch(() => {
+      if (this.pendingHttpRequests.has(requestId)) {
+        return this.cancelPendingHttpRequest(requestId, 'Relay HTTP response consumer cancelled');
+      }
+      return undefined;
     });
 
     return responsePromise;
   }
 
   private handleHttpResponseStart(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
-    const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
-    if (!pending) return;
-    pending.status = validHttpStatus(payload.status) ? payload.status : 502;
-    pending.headers = sanitizeRelayOutgoingHeaders(payload.headers, [this.httpSessionCookieName()]);
-  }
-
-  private handleHttpResponseBody(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
-    const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
-    if (!pending) return;
-    const data = typeof payload.data === 'string' ? payload.data : '';
-    pending.chunks.push(payload.encoding === 'base64' ? base64ToBytes(data) : new TextEncoder().encode(data));
-  }
-
-  private handleHttpResponseEnd(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
     const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
     const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
     if (!requestId || !pending) return;
-    const body = concatBytes(pending.chunks);
-    this.resolvePendingHttpRequest(requestId, new Response(arrayBufferFromBytes(body), {
-      status: pending.status,
-      headers: pending.headers,
-    }));
+    pending.status = validHttpStatus(payload.status) ? payload.status : 502;
+    pending.headers = sanitizeRelayOutgoingHeaders(payload.headers, [this.httpSessionCookieName()]);
+    pending.headers.set(INTERNAL_HTTP_REQUEST_HEADER, requestId);
+    if (!pending.started) {
+      pending.started = true;
+      if (relayResponseHasNoBody(pending.requestMethod, pending.status)) {
+        pending.resolve(new Response(null, {
+          status: pending.status,
+          headers: pending.headers,
+        }));
+        void pending.writer.close().catch(() => undefined);
+        this.removePendingHttpRequest(requestId);
+        return;
+      }
+      pending.resolve(new Response(pending.stream.readable, {
+        status: pending.status,
+        headers: pending.headers,
+      }));
+    }
   }
 
-  private handleHttpResponseError(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
+  private async handleHttpResponseBody(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): Promise<void> {
+    const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+    const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
+    if (!requestId || !pending) return;
+    if (!pending.started) {
+      this.resolvePendingHttpRequest(
+        requestId,
+        jsonResponse({ error: 'Relay response body arrived before response start' }, { status: 502 }),
+        'Relay response body arrived before response start',
+      );
+      return;
+    }
+    const data = typeof payload.data === 'string' ? payload.data : '';
+    const chunk = payload.encoding === 'base64' ? base64ToBytes(data) : new TextEncoder().encode(data);
+    if (chunk.byteLength > pending.maxBufferedBytes || pending.queuedBytes + chunk.byteLength > pending.maxBufferedBytes) {
+      await this.cancelPendingHttpRequest(requestId, 'Relay HTTP response exceeded the bounded stream buffer');
+      return;
+    }
+
+    pending.queuedBytes += chunk.byteLength;
+    const write = pending.writeChain.then(() => pending.writer.write(chunk));
+    pending.writeChain = write.then(
+      () => {
+        pending.queuedBytes -= chunk.byteLength;
+      },
+      () => {
+        pending.queuedBytes -= chunk.byteLength;
+      },
+    );
+    void write.catch(() => this.cancelPendingHttpRequest(
+      requestId,
+      'Relay HTTP response stream failed',
+    ));
+  }
+
+  private async handleHttpResponseEnd(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): Promise<void> {
+    const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
+    const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
+    if (!requestId || !pending) return;
+    if (!pending.started) this.handleHttpResponseStart(payload, tunnel);
+    try {
+      await pending.writeChain;
+      await pending.writer.close();
+    } finally {
+      this.removePendingHttpRequest(requestId);
+    }
+  }
+
+  private async handleHttpResponseError(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): Promise<void> {
     const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
     const pending = this.getOwnedPendingHttpRequest(payload, tunnel);
     if (!requestId || !pending) return;
     const message = typeof payload.message === 'string' ? payload.message : 'Relay server returned an error';
-    this.resolvePendingHttpRequest(requestId, jsonResponse({ error: message }, { status: 502 }));
+    this.resolvePendingHttpRequest(requestId, jsonResponse({ error: message }, { status: 502 }), message);
+    await pending.writeChain.catch(() => undefined);
   }
 
   private getOwnedPendingHttpRequest(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): PendingHttpRequest | null {
@@ -880,12 +1202,52 @@ export class RelayCoordinator {
     return pending;
   }
 
-  private resolvePendingHttpRequest(requestId: string, response: Response): void {
+  private resolvePendingHttpRequest(requestId: string, response: Response, reason = 'Relay HTTP request failed'): void {
     const pending = this.pendingHttpRequests.get(requestId);
     if (!pending) return;
-    clearTimeout(pending.timeout);
+    this.removePendingHttpRequest(requestId);
+    if (pending.started) {
+      void pending.writer.abort(new Error(reason)).catch(() => undefined);
+    } else {
+      pending.resolve(response);
+    }
+  }
+
+  private removePendingHttpRequest(requestId: string): PendingHttpRequest | null {
+    const pending = this.pendingHttpRequests.get(requestId);
+    if (!pending) return null;
     this.pendingHttpRequests.delete(requestId);
-    pending.resolve(response);
+    clearTimeout(pending.timeout);
+    pending.abortSignal.removeEventListener('abort', pending.abortListener);
+    return pending;
+  }
+
+  private async cancelPendingHttpRequest(
+    requestId: string,
+    reason: string,
+    responseStatus = 502,
+  ): Promise<void> {
+    const pending = this.removePendingHttpRequest(requestId);
+    if (!pending) return;
+    const tunnel = this.findTunnelByConnectionId(pending.tunnelConnectionId);
+    if (tunnel) {
+      sendJson(tunnel.socket, {
+        type: 'session-frame',
+        sessionId: pending.sessionId,
+        encoding: 'text',
+        data: JSON.stringify({
+          type: 'http-request-cancel',
+          requestId,
+          reason,
+        }),
+      });
+    }
+
+    if (pending.started) {
+      await pending.writer.abort().catch(() => undefined);
+    } else {
+      pending.resolve(jsonResponse({ error: reason }, { status: responseStatus }));
+    }
   }
 
   private forwardTunnelSessionFrame(payload: JsonRecord, tunnel: RegisteredTunnelAttachment): void {
@@ -1023,7 +1385,9 @@ export class RelayCoordinator {
   }
 
   private async findHttpSessionFromRequest(request: Request): Promise<HttpRelaySessionRecord | null> {
-    const handle = parseCookies(request.headers.get('Cookie'))[this.httpSessionCookieName()];
+    const cookie = parseCookies(request.headers.get('Cookie'))[this.httpSessionCookieName()];
+    const routedCookie = decodeRelayRouteCookie(cookie);
+    const handle = routedCookie?.handle ?? cookie;
     if (!handle) return null;
 
     const session = await this.state.storage.get<HttpRelaySessionRecord>(`${HTTP_SESSION_PREFIX}${handle}`);
@@ -1050,8 +1414,11 @@ export class RelayCoordinator {
   }
 
   private async deleteHttpSession(session: HttpRelaySessionRecord): Promise<void> {
+    const indexedHandle = await this.state.storage.get<string>(`${HTTP_SESSION_BY_ID_PREFIX}${session.sessionId}`);
     await this.state.storage.delete(`${HTTP_SESSION_PREFIX}${session.handle}`);
-    await this.state.storage.delete(`${HTTP_SESSION_BY_ID_PREFIX}${session.sessionId}`);
+    if (indexedHandle === session.handle) {
+      await this.state.storage.delete(`${HTTP_SESSION_BY_ID_PREFIX}${session.sessionId}`);
+    }
   }
 
   private async getHttpSessionBySessionId(sessionId: string): Promise<HttpRelaySessionRecord | null> {
@@ -1099,6 +1466,15 @@ export class RelayCoordinator {
       await this.closeTunnelSessions(attachment.connectionId, condition.detail, condition);
       closeSocket(socket, 1012, toCloseReason(condition, 'Superseded by a newer tunnel'));
     }
+  }
+
+  private async supersedeRemoteTunnel(previousRoute: ServerRouteRecord): Promise<void> {
+    const id = this.env.RELAY_COORDINATOR.idFromName(previousRoute.shardKey);
+    await this.env.RELAY_COORDINATOR.get(id).fetch(internalControlRequest('supersede', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connectionId: previousRoute.connectionId }),
+    }));
   }
 
   private findTunnelByServerId(serverId: string): DurableTunnel | null {
@@ -1190,6 +1566,127 @@ export class RelayCoordinator {
   }
 }
 
+export class RelayRendezvous {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly _env: Env,
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (!isInternalControlRequest(request)) {
+      return jsonResponse({ error: 'Not found' }, { status: 404 });
+    }
+
+    if (url.pathname === `${INTERNAL_CONTROL_PATH_PREFIX}readyz`) {
+      return jsonResponse({ ok: true });
+    }
+
+    const routeMatch = url.pathname.match(/^\/_relay-internal\/routes\/([a-zA-Z0-9_-]+)$/);
+    const routeKey = routeMatch?.[1] ?? '';
+    if (!routeKey) return jsonResponse({ error: 'Not found' }, { status: 404 });
+    const storageKey = `${SERVER_ROUTE_PREFIX}${routeKey}`;
+
+    if (request.method === 'GET') {
+      const route = await this.state.storage.get<ServerRouteRecord>(storageKey);
+      if (!route || route.expiresAt <= Date.now()) {
+        return jsonResponse({ error: 'Relay server route is unavailable' }, { status: 404 });
+      }
+      return jsonResponse({ ok: true, route });
+    }
+
+    const body = await request.json().catch(() => null) as JsonRecord | null;
+    const connectionId = typeof body?.connectionId === 'string' ? body.connectionId : '';
+    if (!connectionId) {
+      return jsonResponse({ error: 'connectionId is required' }, { status: 400 });
+    }
+
+    if (request.method === 'PUT') {
+      const serverId = typeof body?.serverId === 'string' ? body.serverId : '';
+      const shardKey = typeof body?.shardKey === 'string' && validShardKey(body.shardKey)
+        ? body.shardKey
+        : '';
+      const acceptedAt = typeof body?.acceptedAt === 'number' && Number.isFinite(body.acceptedAt)
+        ? body.acceptedAt
+        : 0;
+      if (!serverId || await sha256Base64Url(serverId) !== routeKey) {
+        return jsonResponse({ error: 'Valid serverId is required' }, { status: 400 });
+      }
+      if (!shardKey || !acceptedAt) {
+        return jsonResponse({ error: 'Valid shardKey and acceptedAt are required' }, { status: 400 });
+      }
+      const previous = await this.state.storage.get<ServerRouteRecord>(storageKey) ?? null;
+      if (
+        previous
+        && previous.connectionId !== connectionId
+        && previous.acceptedAt >= acceptedAt
+      ) {
+        return jsonResponse({ error: 'A newer relay server route already exists' }, { status: 409 });
+      }
+      const now = Date.now();
+      const route: ServerRouteRecord = {
+        serverId,
+        shardKey,
+        connectionId,
+        acceptedAt,
+        updatedAt: now,
+        expiresAt: now + envNumber(this._env.RELAY_RENDEZVOUS_TTL_MS, DEFAULT_RENDEZVOUS_TTL_MS),
+      };
+      await this.state.storage.put(storageKey, route);
+      return jsonResponse({ ok: true, route, previous });
+    }
+
+    if (request.method === 'PATCH') {
+      const serverId = typeof body?.serverId === 'string' ? body.serverId : '';
+      const shardKey = typeof body?.shardKey === 'string' && validShardKey(body.shardKey)
+        ? body.shardKey
+        : '';
+      const acceptedAt = typeof body?.acceptedAt === 'number' && Number.isFinite(body.acceptedAt)
+        ? body.acceptedAt
+        : 0;
+      if (!serverId || await sha256Base64Url(serverId) !== routeKey || !shardKey || !acceptedAt) {
+        return jsonResponse({ error: 'Valid server route identity is required' }, { status: 400 });
+      }
+      const existing = await this.state.storage.get<ServerRouteRecord>(storageKey);
+      if (
+        existing
+        && (
+          existing.connectionId !== connectionId
+          || existing.shardKey !== shardKey
+          || existing.acceptedAt !== acceptedAt
+        )
+      ) {
+        return jsonResponse({ error: 'A different relay server route already exists' }, { status: 409 });
+      }
+      const now = Date.now();
+      const route: ServerRouteRecord = existing ?? {
+        serverId,
+        shardKey,
+        connectionId,
+        acceptedAt,
+        updatedAt: now,
+        expiresAt: now,
+      };
+      route.updatedAt = now;
+      route.expiresAt = now + envNumber(this._env.RELAY_RENDEZVOUS_TTL_MS, DEFAULT_RENDEZVOUS_TTL_MS);
+      await this.state.storage.put(storageKey, route);
+      return jsonResponse({ ok: true, route });
+    }
+
+    if (request.method === 'DELETE') {
+      const route = await this.state.storage.get<ServerRouteRecord>(storageKey);
+      if (route?.connectionId === connectionId) {
+        route.updatedAt = Date.now();
+        route.expiresAt = 0;
+        await this.state.storage.put(storageKey, route);
+      }
+      return jsonResponse({ ok: true });
+    }
+
+    return jsonResponse({ error: 'Method not allowed' }, { status: 405 });
+  }
+}
+
 function getBearerToken(request: Request): string | null {
   const authorization = request.headers.get('Authorization');
   if (!authorization?.startsWith('Bearer ')) return null;
@@ -1270,6 +1767,366 @@ function jsonResponse(
   });
 }
 
+async function workerReadinessResponse(env: Env): Promise<Response> {
+  const signedGrantsRequired = env.RELAY_ALLOW_LEGACY_SESSION_GRANTS !== 'true';
+  const configuredKey = env.RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL?.trim() ?? '';
+  const keyConfigured = Boolean(configuredKey);
+  const keyValid = keyConfigured && await validateRelayGrantPublicKey(configuredKey);
+  const relayGrantKeyProbe = keyValid ? 'ok' : keyConfigured ? 'invalid' : 'missing';
+  const coordinatorBinding = Boolean(env.RELAY_COORDINATOR);
+  const rendezvousBinding = Boolean(env.RELAY_RENDEZVOUS);
+  const rendezvousPartitions = rendezvousPartitionCount(env);
+  const rendezvousProbePartition = 0;
+  let coordinatorProbe = 'failed';
+  let rendezvousProbe = 'failed';
+
+  try {
+    const coordinatorId = env.RELAY_COORDINATOR.idFromName('ready-probe-v1');
+    const response = await env.RELAY_COORDINATOR.get(coordinatorId).fetch(internalControlRequest('readyz'));
+    coordinatorProbe = response.ok ? 'ok' : 'failed';
+  } catch {
+    coordinatorProbe = 'failed';
+  }
+
+  try {
+    const response = await rendezvousPartitionStub(env, rendezvousProbePartition)
+      .fetch(internalControlRequest('readyz'));
+    rendezvousProbe = response.ok ? 'ok' : 'failed';
+  } catch {
+    rendezvousProbe = 'failed';
+  }
+
+  const configured = (signedGrantsRequired ? keyValid : !keyConfigured || keyValid)
+    && coordinatorBinding
+    && rendezvousBinding
+    && coordinatorProbe === 'ok'
+    && rendezvousProbe === 'ok';
+  return jsonResponse({
+    ok: configured,
+    runtime: 'cloudflare-worker',
+    durableObjectBinding: coordinatorBinding,
+    rendezvousBinding,
+    coordinatorProbe,
+    rendezvousProbe,
+    rendezvousPartitions,
+    rendezvousProbePartition,
+    relayGrantKeyProbe,
+    signedRelayGrantVerification: signedGrantsRequired ? 'required' : 'legacy-compatible',
+  }, { status: configured ? 200 : 503 });
+}
+
+async function shardKeyForPublicRequest(request: Request, env: Env): Promise<string | null> {
+  const url = new URL(request.url);
+  const upgrade = request.headers.get('Upgrade')?.toLowerCase() ?? '';
+  const legacy = env.RELAY_LEGACY_COORDINATOR_NAME?.trim() || DEFAULT_LEGACY_COORDINATOR_NAME;
+
+  if (upgrade === 'websocket' && url.pathname === '/ws/server') {
+    const token = getBearerToken(request);
+    return token ? `t_${await sha256Base64Url(token)}` : legacy;
+  }
+
+  let grantToken = '';
+  if (upgrade === 'websocket' && url.pathname === '/ws/session') {
+    grantToken = getBearerToken(request) ?? '';
+  } else if (url.pathname.startsWith('/r/')) {
+    const match = url.pathname.match(/^\/r\/([^/]+)/);
+    grantToken = match?.[1] ? decodeURIComponent(match[1]) : '';
+  }
+
+  if (grantToken) {
+    const grant = parseSignedRelayGrantToken(grantToken);
+    if (grant) {
+      return resolveServerShard(env, grant.serverId);
+    }
+    return legacy;
+  }
+
+  const cookie = parseCookies(request.headers.get('Cookie'))[env.RELAY_HTTP_SESSION_COOKIE?.trim() || DEFAULT_COOKIE_NAME];
+  return decodeRelayRouteCookie(cookie)?.shardKey ?? legacy;
+}
+
+async function fetchCoordinator(env: Env, shardKey: string, request: Request): Promise<Response> {
+  const id = env.RELAY_COORDINATOR.idFromName(shardKey);
+  const headers = new Headers(request.headers);
+  headers.delete(INTERNAL_CONTROL_HEADER);
+  headers.set(INTERNAL_SHARD_HEADER, shardKey);
+  const init: RequestInit = { headers };
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    const body = await readRequestBody(request, envNumber(
+      env.RELAY_HTTP_REQUEST_BODY_MAX_BYTES,
+      DEFAULT_HTTP_REQUEST_BODY_MAX_BYTES,
+    ));
+    init.body = body ? arrayBufferFromBytes(body) : null;
+  }
+  return env.RELAY_COORDINATOR.get(id).fetch(new Request(request, init));
+}
+
+function exposeCoordinatorResponse(
+  env: Env,
+  shardKey: string,
+  response: Response,
+  requestSignal: AbortSignal,
+): Response {
+  const requestId = response.headers.get(INTERNAL_HTTP_REQUEST_HEADER);
+  if (!requestId) return response;
+
+  const headers = new Headers(response.headers);
+  headers.delete(INTERNAL_HTTP_REQUEST_HEADER);
+  if (!response.body) {
+    return new Response(null, {
+      status: response.status,
+      statusText: response.statusText,
+      headers,
+    });
+  }
+
+  const reader = response.body.getReader();
+  let completed = false;
+  let cancellation: Promise<void> | null = null;
+  const onRequestAbort = () => {
+    void cancelUpstream('Relay HTTP client disconnected');
+  };
+  const finish = () => {
+    completed = true;
+    requestSignal.removeEventListener('abort', onRequestAbort);
+  };
+  const cancelUpstream = (reason: unknown): Promise<void> => {
+    if (cancellation) return cancellation;
+    if (completed) return Promise.resolve();
+    finish();
+    const cancelReason = relayCancellationReason(reason);
+    cancellation = cancelCoordinatorHttpRequest(env, shardKey, requestId, cancelReason)
+      .then(() => reader.cancel(reason).catch(() => undefined));
+    return cancellation;
+  };
+  requestSignal.addEventListener('abort', onRequestAbort, { once: true });
+  if (requestSignal.aborted) onRequestAbort();
+
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const next = await reader.read();
+        if (next.done) {
+          finish();
+          controller.close();
+          return;
+        }
+        controller.enqueue(next.value);
+      } catch (error) {
+        finish();
+        controller.error(error);
+      }
+    },
+    async cancel(reason) {
+      await cancelUpstream(reason);
+    },
+  });
+
+  return new Response(body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
+
+async function cancelCoordinatorHttpRequest(
+  env: Env,
+  shardKey: string,
+  requestId: string,
+  reason: string,
+): Promise<void> {
+  const id = env.RELAY_COORDINATOR.idFromName(shardKey);
+  await env.RELAY_COORDINATOR.get(id).fetch(internalControlRequest('http-cancel', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ requestId, reason }),
+  })).catch(() => undefined);
+}
+
+function relayCancellationReason(reason: unknown): string {
+  const detail = typeof reason === 'string'
+    ? reason.trim()
+    : reason instanceof Error
+      ? reason.message.trim()
+      : '';
+  return detail
+    ? `Relay HTTP response consumer cancelled: ${detail}`.slice(0, 512)
+    : 'Relay HTTP response consumer cancelled';
+}
+
+function relayAttachSupersededCondition(): RelayConditionResult {
+  return {
+    relayCondition: 'degraded',
+    reasonCode: 'control_plane_error',
+    detail: 'Superseded by an idempotent relay attach retry',
+  };
+}
+
+export const relayWorkerTestHooks = {
+  attachAttemptIdForToken: deriveRelayAttachAttemptId,
+  connectionIdForToken: deriveRelaySessionConnectionId,
+  exposeCoordinatorResponse,
+  rendezvousPartitionForRouteKey,
+  workerReadinessResponse,
+};
+
+async function resolveServerShard(env: Env, serverId: string): Promise<string | null> {
+  return (await resolveServerRoute(env, serverId))?.shardKey ?? null;
+}
+
+async function resolveServerRoute(env: Env, serverId: string): Promise<ServerRouteRecord | null> {
+  const route = await serverRouteLocator(env, serverId);
+  const response = await route.stub.fetch(internalControlRequest(`routes/${route.routeKey}`));
+  if (!response.ok) return null;
+  const body = await response.json() as { route?: ServerRouteRecord };
+  return body.route && validShardKey(body.route.shardKey) ? body.route : null;
+}
+
+async function tunnelOwnsAuthoritativeRoute(env: Env, tunnel: DurableTunnel): Promise<boolean> {
+  const route = await resolveServerRoute(env, tunnel.attachment.serverId);
+  return Boolean(
+    route
+    && route.shardKey === tunnel.attachment.shardKey
+    && route.connectionId === tunnel.attachment.connectionId
+    && route.acceptedAt === Date.parse(tunnel.attachment.registeredAt ?? '')
+  );
+}
+
+async function registerServerShard(
+  env: Env,
+  serverId: string,
+  shardKey: string,
+  connectionId: string,
+  acceptedAt: number,
+): Promise<{ published: boolean; previous: ServerRouteRecord | null; partition: number }> {
+  const route = await serverRouteLocator(env, serverId);
+  const response = await route.stub.fetch(internalControlRequest(`routes/${route.routeKey}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ serverId, shardKey, connectionId, acceptedAt }),
+  }));
+  if (response.status === 409) {
+    return { published: false, previous: null, partition: route.partition };
+  }
+  if (!response.ok) throw new Error('Failed to register relay rendezvous route');
+  const body = await response.json() as { previous?: ServerRouteRecord | null };
+  return {
+    published: true,
+    previous: body.previous ?? null,
+    partition: route.partition,
+  };
+}
+
+async function touchServerShard(
+  env: Env,
+  serverId: string,
+  shardKey: string,
+  connectionId: string,
+  acceptedAt: number,
+): Promise<'ok' | 'superseded' | 'unavailable'> {
+  const route = await serverRouteLocator(env, serverId);
+  const response = await route.stub.fetch(internalControlRequest(`routes/${route.routeKey}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      serverId,
+      shardKey,
+      connectionId,
+      acceptedAt: Number.isFinite(acceptedAt) ? acceptedAt : Date.now(),
+    }),
+  }));
+  if (response.ok) return 'ok';
+  return response.status === 409 ? 'superseded' : 'unavailable';
+}
+
+async function deleteServerShard(env: Env, serverId: string, connectionId: string): Promise<void> {
+  const route = await serverRouteLocator(env, serverId);
+  await route.stub.fetch(internalControlRequest(`routes/${route.routeKey}`, {
+    method: 'DELETE',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ serverId, connectionId }),
+  }));
+}
+
+async function serverRouteLocator(
+  env: Env,
+  serverId: string,
+): Promise<{ routeKey: string; partition: number; stub: DurableObjectStub }> {
+  const routeKey = await sha256Base64Url(serverId);
+  const partition = rendezvousPartitionForRouteKey(routeKey, rendezvousPartitionCount(env));
+  return { routeKey, partition, stub: rendezvousPartitionStub(env, partition) };
+}
+
+function rendezvousPartitionStub(env: Env, partition: number): DurableObjectStub {
+  const baseName = env.RELAY_RENDEZVOUS_NAME?.trim() || DEFAULT_RENDEZVOUS_NAME;
+  const name = `${baseName}:p${partition.toString().padStart(3, '0')}`;
+  return env.RELAY_RENDEZVOUS.get(env.RELAY_RENDEZVOUS.idFromName(name));
+}
+
+function rendezvousPartitionCount(env: Env): number {
+  const configured = Math.trunc(envNumber(
+    env.RELAY_RENDEZVOUS_PARTITIONS,
+    DEFAULT_RENDEZVOUS_PARTITIONS,
+  ));
+  return Math.min(256, Math.max(1, configured));
+}
+
+function rendezvousPartitionForRouteKey(routeKey: string, partitionCount: number): number {
+  let hash = 2166136261;
+  for (let index = 0; index < routeKey.length; index += 1) {
+    hash ^= routeKey.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % Math.max(1, Math.trunc(partitionCount));
+}
+
+async function sha256Base64Url(value: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(value));
+  return bytesToBase64(new Uint8Array(digest))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+}
+
+function validShardKey(value: string): boolean {
+  return /^[a-zA-Z0-9:_-]{1,128}$/.test(value);
+}
+
+function encodeRelayRouteCookie(shardKey: string, handle: string): string {
+  const route = bytesToBase64(new TextEncoder().encode(shardKey))
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+  return `${ROUTE_COOKIE_VERSION}.${route}.${handle}`;
+}
+
+function decodeRelayRouteCookie(value: string | undefined): { shardKey: string; handle: string } | null {
+  if (!value) return null;
+  const match = value.match(/^v1\.([a-zA-Z0-9_-]+)\.([a-fA-F0-9-]{36})$/);
+  if (!match) return null;
+  try {
+    const base64 = match[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=');
+    const shardKey = new TextDecoder().decode(base64ToBytes(padded));
+    return validShardKey(shardKey) ? { shardKey, handle: match[2] } : null;
+  } catch {
+    return null;
+  }
+}
+
+function internalControlRequest(action: string, init: RequestInit = {}): Request {
+  const headers = new Headers(init.headers);
+  headers.set(INTERNAL_CONTROL_HEADER, INTERNAL_CONTROL_VALUE);
+  return new Request(`https://relay.internal${INTERNAL_CONTROL_PATH_PREFIX}${action}`, {
+    ...init,
+    headers,
+  });
+}
+
+function isInternalControlRequest(request: Request): boolean {
+  return request.headers.get(INTERNAL_CONTROL_HEADER) === INTERNAL_CONTROL_VALUE;
+}
+
 function relayLog(message: string, data?: JsonRecord): void {
   console.log(JSON.stringify({
     timestamp: new Date().toISOString(),
@@ -1319,11 +2176,42 @@ function relaySessionMaxAgeSeconds(expiresAt: number, now = new Date()): number 
 
 async function readRequestBody(request: Request, maxBytes: number): Promise<Uint8Array | undefined> {
   if (request.method === 'GET' || request.method === 'HEAD') return undefined;
-  const bytes = new Uint8Array(await request.arrayBuffer());
-  if (bytes.byteLength > maxBytes) {
-    throw new Error('Relay HTTP request body is too large');
+  const limit = Math.max(0, Math.trunc(maxBytes));
+  if (declaredRequestBodyTooLarge(request, limit)) {
+    await request.body?.cancel('Relay HTTP request body is too large').catch(() => undefined);
+    throw new RelayRequestBodyTooLargeError('Relay HTTP request body is too large');
   }
-  return bytes.byteLength > 0 ? bytes : undefined;
+  if (!request.body) return undefined;
+
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let totalBytes = 0;
+  try {
+    for (;;) {
+      const next = await reader.read();
+      if (next.done) break;
+      if (next.value.byteLength === 0) continue;
+      if (totalBytes + next.value.byteLength > limit) {
+        await reader.cancel('Relay HTTP request body is too large').catch(() => undefined);
+        throw new RelayRequestBodyTooLargeError('Relay HTTP request body is too large');
+      }
+      totalBytes += next.value.byteLength;
+      chunks.push(next.value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return totalBytes > 0 ? concatBytes(chunks) : undefined;
+}
+
+function declaredRequestBodyTooLarge(request: Request, maxBytes: number): boolean {
+  if (request.method === 'GET' || request.method === 'HEAD') return false;
+  const contentLength = request.headers.get('Content-Length');
+  return Boolean(
+    contentLength
+    && /^\d+$/.test(contentLength)
+    && Number(contentLength) > Math.max(0, Math.trunc(maxBytes))
+  );
 }
 
 function sanitizeRelayIncomingHeaders(headers: Headers, protectedCookieNames: string[] = []): Array<[string, string]> {
@@ -1424,8 +2312,15 @@ function arrayBufferFromBytes(bytes: Uint8Array): ArrayBuffer {
 function validHttpStatus(value: unknown): value is number {
   return typeof value === 'number'
     && Number.isInteger(value)
-    && value >= 100
+    && value >= 200
     && value <= 599;
+}
+
+function relayResponseHasNoBody(requestMethod: string, status: number): boolean {
+  return requestMethod.toUpperCase() === 'HEAD'
+    || status === 204
+    || status === 205
+    || status === 304;
 }
 
 function isJsonObject(value: unknown): value is JsonRecord {

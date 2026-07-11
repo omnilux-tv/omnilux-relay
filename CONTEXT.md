@@ -32,6 +32,26 @@ _Avoid_: App login, direct origin navigation, bearer token in asset URL
 A relay-owned message shape used to move requests, response starts, response bodies, response ends, stream chunks, session close reasons, and heartbeat or condition evidence between a relay session and server tunnel.
 _Avoid_: Product event, runtime API DTO, cloud ledger row
 
+**Relay Rendezvous**:
+The short-lived directory that maps a registered server to the coordinator shard holding its live tunnel.
+_Avoid_: Entitlement store, permanent server registry, control-plane database
+
+**Coordinator Shard**:
+A hibernation-aware Durable Object coordination point that owns a bounded subset of live tunnels, sessions, and pending HTTP streams.
+_Avoid_: Global singleton, customer database, region
+
+**Relay Response Stream**:
+The bounded browser HTTP response exposed when `http-response-start` arrives and incrementally filled by `http-response-body` frames.
+_Avoid_: Fully buffered response, media object storage
+
+**Relay Request Cancellation**:
+The idempotent `http-request-cancel` session frame that asks the self-hosted runtime to abort a pending local fetch after downstream disconnect, timeout, or response-buffer exhaustion.
+_Avoid_: Session revocation, entitlement cancellation
+
+**Relay Attach Identity**:
+The pair of independently domain-separated token hashes used as the stable `attachAttemptId` and logical session `connectionId` for every replay of one signed relay grant.
+_Avoid_: Raw grant token, tunnel connection ID, mutable retry counter
+
 **Transport Condition**:
 The transport-level health state emitted by relay logs, heartbeats, and close messages.
 _Avoid_: User-facing status copy, billing state
@@ -53,6 +73,10 @@ _Avoid_: Control plane, customer app, public edge, self-hosted runtime
 - A **Server Tunnel** is registered by a self-hosted runtime.
 - A **Relay Session** attaches to a live **Server Tunnel**.
 - **Relay Frames** move transport data between a **Relay Session** and a **Server Tunnel**.
+- **Relay Rendezvous** routes an authorized session to the **Coordinator Shard** holding its server tunnel and is refreshed by registration and heartbeat.
+- A **Relay Response Stream** applies bounded backpressure rather than retaining the entire response in a coordinator.
+- **Relay Request Cancellation** releases runtime work when the downstream response can no longer be consumed.
+- A **Relay Attach Identity** makes response-loss and reconnect retries idempotent while preventing delayed requests from overwriting newer state.
 - **Browser Session Handoff** binds a browser to a **Relay Session**.
 - **Browser HTTP Relay** forwards subsequent browser requests through **Relay Frames**.
 - A **Signed Session Grant** is issued by the control plane and verified by the **Relay Runtime**.

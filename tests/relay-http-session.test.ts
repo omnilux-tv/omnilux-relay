@@ -87,6 +87,39 @@ test('looks up browser HTTP relay sessions from cookies and updates last-seen ti
   assert.equal(store.getBySessionId('session-1'), session);
 });
 
+test('removing a superseded HTTP session cannot delete its newer session-id mapping', () => {
+  const store = createRelayHttpSessionStore();
+  const consumedSession = {
+    sessionId: 'session-retry',
+    serverId: 'server-1',
+    connectionId: 'attach-1',
+    attachAttemptId: 'raa_retry',
+    sessionType: 'remote-access',
+  };
+  const first = createHttpRelaySessionRecord({
+    handle: 'handle-old',
+    consumedSession,
+    tunnelConnectionId: 'tunnel-old',
+    ttlMs: 60_000,
+  });
+  const retry = createHttpRelaySessionRecord({
+    handle: 'handle-new',
+    consumedSession: {
+      ...consumedSession,
+      connectionId: 'attach-2',
+    },
+    tunnelConnectionId: 'tunnel-new',
+    ttlMs: 60_000,
+  });
+
+  store.add(first);
+  store.add(retry);
+  store.remove(first);
+
+  assert.equal(store.getByHandle(first.handle), undefined);
+  assert.equal(store.getBySessionId(retry.sessionId), retry);
+});
+
 test('expires browser HTTP relay sessions through lookup and sweep paths', () => {
   const store = createRelayHttpSessionStore();
   const now = new Date('2026-06-24T10:00:00.000Z');

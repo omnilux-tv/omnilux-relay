@@ -1,0 +1,132 @@
+name: Promote Relay Worker To Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full immutable commit SHA already validated in staging
+        required: true
+        type: string
+      staging_version_id:
+        description: Staging Worker version ID that carries the release SHA
+        required: true
+        type: string
+      rollback_version_id:
+        description: Existing production Worker version ID approved for rollback
+        required: true
+        type: string
+      change_reference:
+        description: Approved release or change reference
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  promote-production:
+    runs-on: ubuntu-latest
+    environment: relay-production
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      RELEASE_SHA: ${{ inputs.release_sha }}
+      STAGING_VERSION_ID: ${{ inputs.staging_version_id }}
+      ROLLBACK_VERSION_ID: ${{ inputs.rollback_version_id }}
+      CHANGE_REFERENCE: ${{ inputs.change_reference }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ inputs.release_sha }}
+
+      - name: Verify immutable release revision
+        run: |
+          test "$(git rev-parse HEAD)" = "$RELEASE_SHA"
+          test "${#RELEASE_SHA}" -eq 40
+
+      - name: Checkout shared packages
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: omnilux-tv/omnilux-packages
+          ref: e4d6cb1de04acd4a40855de52ac7ec9dcc6e2d7d
+          path: shared/omnilux-packages
+          ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
+
+      - name: Link shared packages
+        run: ln -sfn "$GITHUB_WORKSPACE/shared/omnilux-packages" "$GITHUB_WORKSPACE/../omnilux-packages"
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 22
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Install and build shared contracts
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm --filter @omnilux/types build
+          pnpm --filter @omnilux/api-contracts build
+        working-directory: shared/omnilux-packages
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate exact production artifact
+        run: pnpm test:release-config && pnpm lint:worker && pnpm test:worker-smoke && pnpm build:worker:production
+
+      - name: Verify staged release evidence
+        run: |
+          pnpm exec wrangler versions list --config wrangler.staging.jsonc --json > worker-staging-versions-before.json
+          pnpm exec wrangler deployments list --config wrangler.staging.jsonc --json > worker-staging-deployments-before.json
+          node scripts/verify-worker-deployment-evidence.mjs \
+            --versions worker-staging-versions-before.json \
+            --version-id "$STAGING_VERSION_ID" \
+            --release-sha "$RELEASE_SHA" \
+            > worker-staging-release-evidence.json
+
+      - name: Capture and verify rollback evidence
+        run: |
+          pnpm exec wrangler versions list --config wrangler.production.jsonc --json > worker-production-versions-before.json
+          pnpm exec wrangler deployments list --config wrangler.production.jsonc --json > worker-deployments-before.json
+          node scripts/verify-worker-deployment-evidence.mjs \
+            --versions worker-production-versions-before.json \
+            --version-id "$ROLLBACK_VERSION_ID" \
+            > worker-rollback-evidence.json
+          jq -n \
+            --arg releaseSha "$RELEASE_SHA" \
+            --arg stagingVersionId "$STAGING_VERSION_ID" \
+            --arg rollbackVersionId "$ROLLBACK_VERSION_ID" \
+            --arg changeReference "$CHANGE_REFERENCE" \
+            '{releaseSha: $releaseSha, stagingVersionId: $stagingVersionId, rollbackVersionId: $rollbackVersionId, changeReference: $changeReference}' \
+            > worker-release-intent.json
+
+      - name: Promote immutable production revision
+        run: pnpm exec wrangler deploy --config wrangler.production.jsonc --strict --tag "$RELEASE_SHA" --message "$CHANGE_REFERENCE; rollback=$ROLLBACK_VERSION_ID"
+
+      - name: Probe production and roll back on failure
+        run: |
+          if ! curl --fail --silent --show-error --retry 6 --retry-delay 5 https://relay.omnilux.tv/readyz; then
+            pnpm exec wrangler rollback "$ROLLBACK_VERSION_ID" --config wrangler.production.jsonc --message "automatic rollback after failed readiness for $RELEASE_SHA" --yes
+            exit 1
+          fi
+
+      - name: Capture deployed version evidence
+        if: always()
+        run: pnpm exec wrangler deployments list --config wrangler.production.jsonc --json > worker-deployments-after.json
+
+      - name: Upload release and rollback evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: relay-worker-production-${{ inputs.release_sha }}
+          path: |
+            worker-release-intent.json
+            worker-staging-release-evidence.json
+            worker-staging-versions-before.json
+            worker-staging-deployments-before.json
+            worker-rollback-evidence.json
+            worker-production-versions-before.json
+            worker-deployments-before.json
+            worker-deployments-after.json
+          if-no-files-found: warn

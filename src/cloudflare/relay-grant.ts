@@ -152,6 +152,18 @@ async function importRelayGrantPublicKey(
   }
 }
 
+export async function validateRelayGrantPublicKey(
+  publicKeySpkiBase64Url: string
+): Promise<boolean> {
+  const key = await importRelayGrantPublicKey(publicKeySpkiBase64Url);
+  return Boolean(
+    key &&
+    key.type === "public" &&
+    key.algorithm.name === "Ed25519" &&
+    key.usages.includes("verify")
+  );
+}
+
 function relayGrantRejected(detail: string): RelayGrantVerificationResult {
   return {
     ok: false,

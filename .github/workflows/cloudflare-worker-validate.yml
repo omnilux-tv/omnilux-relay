@@ -1,6 +1,17 @@
-name: Deploy Relay Worker
+name: Validate Relay Worker
 
 on:
+  pull_request:
+    paths:
+      - 'src/cloudflare/**'
+      - 'src/relay-condition.ts'
+      - 'src/relay-control-plane.ts'
+      - 'tests/**'
+      - 'wrangler*.jsonc'
+      - 'tsconfig.cloudflare.json'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/cloudflare-worker-*.yml'
   push:
     branches:
       - main
@@ -8,36 +19,34 @@ on:
       - 'src/cloudflare/**'
       - 'src/relay-condition.ts'
       - 'src/relay-control-plane.ts'
-      - 'wrangler.jsonc'
+      - 'tests/**'
+      - 'wrangler*.jsonc'
       - 'tsconfig.cloudflare.json'
       - 'package.json'
       - 'pnpm-lock.yaml'
-      - '.github/workflows/cloudflare-worker-deploy.yml'
-  workflow_dispatch:
+      - '.github/workflows/cloudflare-worker-*.yml'
 
 permissions:
   contents: read
 
 jobs:
-  deploy:
+  validate:
     runs-on: ubuntu-latest
-    env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
       - name: Checkout shared packages
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
         with:
           repository: omnilux-tv/omnilux-packages
+          ref: e4d6cb1de04acd4a40855de52ac7ec9dcc6e2d7d
           path: shared/omnilux-packages
           ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
 
       - name: Link shared packages
         run: ln -sfn "$GITHUB_WORKSPACE/shared/omnilux-packages" "$GITHUB_WORKSPACE/../omnilux-packages"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
         with:
           node-version: 22
 
@@ -55,11 +64,20 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Validate release configuration
+        run: pnpm test:release-config
+
       - name: Lint Cloudflare Worker
         run: pnpm lint:worker
 
-      - name: Build Cloudflare Worker
+      - name: Run Worker smoke tests
+        run: pnpm test:worker-smoke
+
+      - name: Build Worker without deployment
         run: pnpm build:worker
 
-      - name: Deploy Cloudflare Worker
-        run: pnpm deploy:worker
+      - name: Build staging Worker without deployment
+        run: pnpm build:worker:staging
+
+      - name: Build production Worker without deployment
+        run: pnpm build:worker:production

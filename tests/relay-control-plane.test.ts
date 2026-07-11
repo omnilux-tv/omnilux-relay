@@ -24,7 +24,10 @@ test('relay control-plane client posts typed register, heartbeat, and consume ca
 
   await client.registerRelayConnection('relay-token', { connectionId: 'conn-1' });
   await client.recordRelayHeartbeat('relay-token', { connectionId: 'conn-1' });
-  await client.consumeRelaySession('grant-token', { connectionId: 'conn-2' });
+  await client.consumeRelaySession('grant-token', {
+    connectionId: 'conn-2',
+    attachAttemptId: 'raa_attempt-2',
+  });
 
   assert.deepEqual(calls.map((call) => call.url), [
     'https://api.omnilux.tv/functions/v1/register-relay-connection',
@@ -49,7 +52,10 @@ test('relay control-plane client extracts error messages from non-success JSON r
       })) as typeof fetch,
   });
 
-  const result = await client.consumeRelaySession('bad-token', { connectionId: 'conn-1' });
+  const result = await client.consumeRelaySession('bad-token', {
+    connectionId: 'conn-1',
+    attachAttemptId: 'raa_attempt-1',
+  });
 
   assert.deepEqual(result, {
     ok: false,

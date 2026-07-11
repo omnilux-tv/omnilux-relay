@@ -202,6 +202,17 @@ function closeExpiredHttpRelaySessions() {
   closeExpiredStoredHttpRelaySessions(httpSessionStore, closeHttpRelaySession);
 }
 
+function closeExistingRelaySession(sessionId: string) {
+  const condition: RelayConditionResult = {
+    relayCondition: 'degraded',
+    reasonCode: 'control_plane_error',
+    detail: 'Superseded by an idempotent relay attach retry',
+  };
+  closeSession(sessionId, 1012, condition.detail, condition);
+  const httpSession = httpSessionStore.getBySessionId(sessionId);
+  if (httpSession) closeHttpRelaySession(httpSession, condition.detail);
+}
+
 async function createHttpRelaySession(token: string): Promise<HttpRelaySession> {
   const attachment = await attachRelaySession({
     token,
@@ -216,6 +227,7 @@ async function createHttpRelaySession(token: string): Promise<HttpRelaySession> 
 
   const consumedSession = attachment.consumedSession;
   const tunnel = attachment.tunnel;
+  closeExistingRelaySession(consumedSession.sessionId);
   const session = createHttpRelaySessionRecord({
     handle: crypto.randomUUID(),
     consumedSession,
@@ -367,9 +379,10 @@ function closeSession(
     reasonCode: 'session_attach_error',
     detail: 'Relay session closed',
   },
+  expectedClientSocket?: WebSocket,
 ) {
   const session = sessionsById.get(sessionId);
-  if (!session) return;
+  if (!session || (expectedClientSocket && session.clientSocket !== expectedClientSocket)) return;
 
   sessionsById.delete(sessionId);
   if (session.expiryTimer) clearTimeout(session.expiryTimer);
@@ -643,6 +656,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
 
   const consumedSession = attachment.consumedSession;
   const tunnel = attachment.tunnel;
+  closeExistingRelaySession(consumedSession.sessionId);
   const cloudExpiresAt = consumedSession.expiresAt ? Date.parse(consumedSession.expiresAt) : NaN;
   const session: RelaySession = {
     sessionId: consumedSession.sessionId,
@@ -660,7 +674,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
       reasonCode: 'token_expired',
       detail: 'Relay session expired',
     };
-    closeSession(session.sessionId, 4401, condition.detail, condition);
+    closeSession(session.sessionId, 4401, condition.detail, condition, session.clientSocket);
   }, Math.max(1, session.expiresAt - Date.now()));
 
   sessionsById.set(session.sessionId, session);
@@ -695,7 +709,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
         reasonCode: 'tunnel_missing',
         detail: 'Relay tunnel is not available',
       };
-      closeSession(session.sessionId, 1011, 'Relay tunnel is not available', condition);
+      closeSession(session.sessionId, 1011, 'Relay tunnel is not available', condition, clientSocket);
       return;
     }
 
@@ -712,7 +726,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
         reasonCode: 'frame_forwarding_error',
         detail: 'Failed to forward frame',
       };
-      closeSession(session.sessionId, 1011, 'Frame forwarding failed', condition);
+      closeSession(session.sessionId, 1011, 'Frame forwarding failed', condition, clientSocket);
     }
   });
 
@@ -722,7 +736,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
       reasonCode: 'client_socket_error',
       detail: 'Client disconnected',
     };
-    closeSession(session.sessionId, 1000, 'Client disconnected', condition);
+    closeSession(session.sessionId, 1000, 'Client disconnected', condition, clientSocket);
   });
 
   clientSocket.on('error', () => {
@@ -731,7 +745,7 @@ async function attachClientSession(clientSocket: WebSocket, token: string) {
       reasonCode: 'client_socket_error',
       detail: 'Client socket error',
     };
-    closeSession(session.sessionId, 1011, 'Client socket error', condition);
+    closeSession(session.sessionId, 1011, 'Client socket error', condition, clientSocket);
   });
 }
 

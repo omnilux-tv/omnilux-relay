@@ -1,21 +1,26 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "omnilux-relay-local",
+  "name": "omnilux-relay-staging",
   "main": "src/cloudflare/index.ts",
   "compatibility_date": "2026-06-28",
+  "workers_dev": false,
   "observability": {
     "enabled": true
   },
-  "workers_dev": false,
-  "routes": [],
+  "routes": [
+    {
+      "pattern": "relay-test.omnilux.tv/*",
+      "zone_name": "omnilux.tv"
+    }
+  ],
   "vars": {
-    "RELAY_CONTROL_URL": "https://api.omnilux.tv/functions/v1",
-    "RELAY_GRANT_AUDIENCE": "relay.omnilux.tv",
-    "RELAY_LEGACY_COORDINATOR_NAME": "global",
+    "RELAY_CONTROL_URL": "https://api-test.omnilux.tv/functions/v1",
+    "RELAY_GRANT_AUDIENCE": "relay-test.omnilux.tv",
+    "RELAY_LEGACY_COORDINATOR_NAME": "staging-global",
     "RELAY_RENDEZVOUS_NAME": "relay-rendezvous-v1",
     "RELAY_RENDEZVOUS_PARTITIONS": "64",
-    "RELAY_HTTP_SESSION_COOKIE": "omnilux_relay_session",
-    "RELAY_REGION": "cloudflare-global"
+    "RELAY_HTTP_SESSION_COOKIE": "omnilux_relay_staging_session",
+    "RELAY_REGION": "cloudflare-staging"
   },
   "durable_objects": {
     "bindings": [

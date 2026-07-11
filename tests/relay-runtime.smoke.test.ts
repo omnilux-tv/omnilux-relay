@@ -122,6 +122,22 @@ const nextJsonMessage = async (socket: WebSocket): Promise<Record<string, unknow
   return JSON.parse(text) as Record<string, unknown>;
 };
 
+const nextJsonMessages = (
+  socket: WebSocket,
+  count: number,
+): Promise<Array<Record<string, unknown>>> =>
+  new Promise((resolve) => {
+    const messages: Array<Record<string, unknown>> = [];
+    const onMessage = (raw: WebSocket.RawData) => {
+      messages.push(JSON.parse(raw.toString()) as Record<string, unknown>);
+      if (messages.length === count) {
+        socket.off('message', onMessage);
+        resolve(messages);
+      }
+    };
+    socket.on('message', onMessage);
+  });
+
 const nextCloseEvent = (socket: WebSocket) =>
   new Promise<{ code: number; reason: Buffer }>((resolve, reject) => {
     socket.once('close', (code, reason) => resolve({ code, reason }));
@@ -238,7 +254,11 @@ before(async () => {
         return;
       }
 
-      json(res, 200, session);
+      json(res, 200, {
+        ...session,
+        connectionId: body.connectionId,
+        attachAttemptId: body.attachAttemptId,
+      });
       return;
     }
 
@@ -457,6 +477,55 @@ test('session websocket verifies a signed relay grant before attaching', async (
   await closeSocket(tunnelSocket);
 });
 
+test('same-token websocket retry closes the prior local session before reopening', async () => {
+  const serverId = 'server-retry-session';
+  const sessionId = 'session-retry';
+  const token = createSignedRelayGrantToken({ serverId });
+  controlPlaneState.sessionsByToken.set(token, {
+    sessionId,
+    serverId,
+    userId: 'user-123',
+    sessionType: 'remote-access',
+  });
+  const { socket: tunnelSocket } = await connectServerTunnel(`server-token:${serverId}`);
+
+  const firstTunnelOpen = nextJsonMessage(tunnelSocket);
+  const firstSocket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const firstReady = nextJsonMessage(firstSocket);
+  await once(firstSocket, 'open');
+  assert.equal((await firstTunnelOpen).type, 'session-open');
+  assert.equal((await firstReady).type, 'session-ready');
+
+  const firstClose = nextCloseEvent(firstSocket);
+  const retryTunnelMessages = nextJsonMessages(tunnelSocket, 2);
+  const retrySocket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const retryReady = nextJsonMessage(retrySocket);
+  await once(retrySocket, 'open');
+
+  const closed = await firstClose;
+  assert.equal(closed.code, 1012);
+  assert.match(closed.reason.toString('utf8'), /idempotent relay attach retry/i);
+  assert.deepEqual((await retryTunnelMessages).map(({ type }) => type), [
+    'session-close',
+    'session-open',
+  ]);
+  assert.equal((await retryReady).type, 'session-ready');
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(retrySocket.readyState, WebSocket.OPEN);
+
+  const consumeCalls = controlPlaneState.consumeCalls.filter(({ token: value }) => value === token);
+  assert.equal(consumeCalls.length, 2);
+  assert.equal(consumeCalls[0].body.attachAttemptId, consumeCalls[1].body.attachAttemptId);
+  assert.equal(consumeCalls[0].body.connectionId, consumeCalls[1].body.connectionId);
+
+  await closeSocket(retrySocket);
+  await closeSocket(tunnelSocket);
+});
+
 test('session websocket closes when heartbeat reports the consumed session was revoked', async () => {
   const token = createSignedRelayGrantToken({ serverId: 'server-revoked-session' });
   controlPlaneState.sessionsByToken.set(token, {
@@ -604,6 +673,7 @@ test('session websocket rejects signed grants whose consumed session binding doe
     userId: 'user-123',
     sessionType: 'remote-access',
   });
+  const { socket: tunnelSocket } = await connectServerTunnel('server-token:server-bound-in-grant');
 
   const socket = new WebSocket(`${relayOrigin.replace('http', 'ws')}/ws/session?nonce=${randomUUID()}`, {
     headers: {
@@ -615,6 +685,7 @@ test('session websocket rejects signed grants whose consumed session binding doe
   assert.equal(closeEvent.code, 4401);
   assert.match(closeEvent.reason.toString('utf8'), /Relay grant does not match consumed session/);
   assert.equal(controlPlaneState.consumeCalls.length, 1);
+  await closeSocket(tunnelSocket);
 });
 
 test('session websocket rejects expired signed grants before control-plane consumption', async () => {
