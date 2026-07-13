@@ -69,6 +69,7 @@ let controlPlaneServer: ReturnType<typeof createServer>;
 let controlPlaneOrigin = "";
 let worker: Unstable_DevWorker;
 let workerPersistDir = "";
+const openSockets = new Set<WebSocket>();
 
 const createSignedRelayGrantToken = (input: {
   serverId: string;
@@ -207,7 +208,11 @@ const closeSocket = async (
 const workerOrigin = () => `http://${worker.address}:${worker.port}`;
 const workerWsOrigin = () => `ws://${worker.address}:${worker.port}`;
 
-const openWebSocket = (url: string, token: string): Promise<WebSocket> =>
+const openWebSocket = (
+  url: string,
+  token: string,
+  onCreated?: (socket: WebSocket) => void
+): Promise<WebSocket> =>
   withTimeout(
     new Promise((resolve, reject) => {
       const socket = new WebSocket(url, {
@@ -215,6 +220,9 @@ const openWebSocket = (url: string, token: string): Promise<WebSocket> =>
           Authorization: "Bearer " + token,
         },
       });
+      openSockets.add(socket);
+      socket.once("close", () => openSockets.delete(socket));
+      onCreated?.(socket);
       socket.once("open", () => resolve(socket));
       socket.once("error", reject);
       socket.once("unexpected-response", (_request, response) => {
@@ -233,6 +241,7 @@ const connectServerTunnel = async (serverId: string, tokenOverride?: string) => 
     `${workerWsOrigin()}/ws/server?nonce=${randomUUID()}`,
     token
   );
+  const registeredPromise = nextJsonMessage(socket, "tunnel registration");
   socket.send(
     JSON.stringify({
       type: "register",
@@ -241,7 +250,7 @@ const connectServerTunnel = async (serverId: string, tokenOverride?: string) => 
       clientVersion: "test-suite",
     })
   );
-  const registered = await nextJsonMessage(socket, "tunnel registration");
+  const registered = await registeredPromise;
   assert.equal(registered.type, "registered", JSON.stringify(registered));
   assert.equal(registered.serverId, serverId);
   return { socket, registered, token };
@@ -397,7 +406,18 @@ after(async () => {
     rmSync(workerPersistDir, { recursive: true, force: true });
 });
 
-afterEach(() => {
+afterEach(async () => {
+  for (const socket of [...openSockets]) {
+    if (socket.readyState === WebSocket.CONNECTING) {
+      socket.terminate();
+      continue;
+    }
+    try {
+      await withTimeout(closeSocket(socket), "closing smoke websocket", 2_000);
+    } catch {
+      socket.terminate();
+    }
+  }
   controlPlaneState.registerCalls = [];
   controlPlaneState.heartbeatCalls = [];
   controlPlaneState.consumeCalls = [];
@@ -496,20 +516,27 @@ test("Cloudflare Worker relay parity smoke covers readyz, tunnel registration, s
     metadata: { surface: "worker-ws" },
   });
 
-  const sessionSocket = await openWebSocket(
-    `${workerWsOrigin()}/ws/session?nonce=${randomUUID()}`,
-    wsGrant
-  );
-  const tunnelOpen = await nextJsonMessage(
+  const tunnelOpenPromise = nextJsonMessage(
     tunnelSocket,
     "websocket session-open on tunnel"
   );
+  let sessionReadyPromise!: Promise<Record<string, unknown>>;
+  const sessionSocket = await openWebSocket(
+    `${workerWsOrigin()}/ws/session?nonce=${randomUUID()}`,
+    wsGrant,
+    (socket) => {
+      sessionReadyPromise = nextJsonMessage(
+        socket,
+        "websocket session-ready on client"
+      );
+    }
+  );
+  const [tunnelOpen, sessionReady] = await Promise.all([
+    tunnelOpenPromise,
+    sessionReadyPromise,
+  ]);
   assert.equal(tunnelOpen.type, "session-open");
   assert.equal(tunnelOpen.sessionId, "session-ws");
-  const sessionReady = await nextJsonMessage(
-    sessionSocket,
-    "websocket session-ready on client"
-  );
   assert.equal(sessionReady.type, "session-ready");
   assert.equal(sessionReady.sessionId, "session-ws");
   await closeSocket(sessionSocket);
