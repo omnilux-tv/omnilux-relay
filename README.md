@@ -86,6 +86,30 @@ Both runtimes preserve the same tunnel/session protocol:
 
 The canonical edge-consumed artifact is `ghcr.io/omnilux-tv/omnilux-relay-runtime`.
 
+### Relay image release evidence
+
+The image workflow is tag-triggered or manually dispatched with a full commit
+SHA that is reachable from `main`. It is disabled unless the `RELAY_IMAGE_RELEASE_ENABLED` repository variable
+is exactly `true`, and every run is protected by the `relay-production` GitHub
+environment.
+
+All relay source gates run before the workflow builds the Linux AMD64 artifact
+once into an ephemeral localhost registry. It boots the exact candidate and
+requires `/healthz` before registry authentication, then verifies that digest,
+requires BuildKit `mode=max`
+provenance and a populated SPDX SBOM, and checks the runtime revision, artifact
+version, and pinned `omnilux-packages` revision labels before authenticating to
+GHCR. It then copies the already-verified digest and attestations to the canonical
+repository without rebuilding and verifies every promoted tag resolves to the
+same digest. The exact evidence is retained as a workflow artifact. A
+full-revision `sha-<40-character-commit>` tag is always created; release tags also
+create version and major/minor aliases. Publication is serialized across all
+release refs so aliases cannot race backward. The workflow never publishes `latest`.
+
+```bash
+pnpm test:image-release
+```
+
 ## Cloudflare Worker relay
 
 Worker configuration is deliberately staging-only:

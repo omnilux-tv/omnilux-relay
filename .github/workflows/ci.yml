@@ -51,6 +51,9 @@ jobs:
       - name: Smoke tests
         run: pnpm test:smoke
 
+      - name: Relay image release contract
+        run: pnpm test:image-release
+
       - name: Build
         run: pnpm build
 

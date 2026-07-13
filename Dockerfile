@@ -1,11 +1,11 @@
-FROM node:22-bookworm-slim AS base
+FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf AS base
 
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate && \
     apt-get update && \
     apt-get install -y --no-install-recommends tini curl ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-FROM node:22-bookworm-slim AS builder
+FROM node:22-bookworm-slim@sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf AS builder
 
 RUN corepack enable && corepack prepare pnpm@10.32.1 --activate
 
@@ -28,11 +28,19 @@ RUN pnpm build
 
 FROM base AS runtime
 
+ARG RELAY_VERSION=0.1.0
+ARG RELAY_REVISION=unknown
+ARG OMNILUX_PACKAGES_REVISION=unknown
+
 LABEL org.opencontainers.image.title="OmniLux Relay" \
       org.opencontainers.image.description="OmniLux remote relay runtime" \
-      org.opencontainers.image.version="0.1.0" \
+      org.opencontainers.image.version="${RELAY_VERSION}" \
+      org.opencontainers.image.revision="${RELAY_REVISION}" \
       org.opencontainers.image.source="https://github.com/omnilux-tv/omnilux-relay" \
-      org.opencontainers.image.licenses="LicenseRef-OmniLux-Customer-License"
+      org.opencontainers.image.base.name="docker.io/library/node:22-bookworm-slim" \
+      org.opencontainers.image.base.digest="sha256:53ada149d435c38b14476cb57e4a7da73c15595aba79bd6971b547ceb6d018bf" \
+      org.opencontainers.image.licenses="LicenseRef-OmniLux-Customer-License" \
+      tv.omnilux.omnilux-packages.revision="${OMNILUX_PACKAGES_REVISION}"
 
 WORKDIR /app
 

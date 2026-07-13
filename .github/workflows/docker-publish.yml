@@ -2,15 +2,25 @@ name: Publish Relay Image
 
 on:
   push:
-    branches:
-      - main
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      release_sha:
+        description: Full immutable omnilux-relay commit SHA to release
+        required: true
+        type: string
+
+concurrency:
+  group: relay-image-production
+  cancel-in-progress: false
 
 env:
   REGISTRY: ghcr.io
   RELAY_IMAGE: ghcr.io/omnilux-tv/omnilux-relay-runtime
+  LOCAL_CANDIDATE_IMAGE: localhost:5000/omnilux-relay-runtime-candidate
+  OMNILUX_PACKAGES_REVISION: 4417465ef7068f0a4576f7028d277e5367388992
+  REQUESTED_RELEASE_SHA: ${{ github.event_name == 'workflow_dispatch' && inputs.release_sha || github.sha }}
 
 permissions:
   contents: read
@@ -18,64 +28,307 @@ permissions:
 
 jobs:
   publish:
+    if: ${{ vars.RELAY_IMAGE_RELEASE_ENABLED == 'true' }}
     runs-on: ubuntu-latest
+    environment:
+      name: relay-production
+    services:
+      registry:
+        image: registry:2@sha256:a3d8aaa63ed8681a604f1dea0aa03f100d5895b6a58ace528858a7b332415373
+        ports:
+          - 5000:5000
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ env.REQUESTED_RELEASE_SHA }}
+          fetch-depth: 0
 
       - name: Checkout shared packages
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: omnilux-tv/omnilux-packages
           ref: 4417465ef7068f0a4576f7028d277e5367388992
           path: shared/omnilux-packages
           ssh-key: ${{ secrets.OMNILUX_PACKAGES_DEPLOY_KEY }}
 
-      - uses: docker/setup-buildx-action@v3
+      - name: Verify immutable release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          revision="$(git rev-parse HEAD)"
+          packages_revision="$(git -C shared/omnilux-packages rev-parse HEAD)"
+          package_version="$(node -p "require('./package.json').version")"
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+          test "$revision" = "$REQUESTED_RELEASE_SHA"
+          test "$packages_revision" = "$OMNILUX_PACKAGES_REVISION"
+          [[ "$revision" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$packages_revision" =~ ^[a-f0-9]{40}$ ]]
+          git fetch --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
+          git merge-base --is-ancestor "$revision" origin/main
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "$revision" = "$GITHUB_SHA"
+            test "${GITHUB_REF_NAME#v}" = "$package_version"
+          fi
+
+          artifact_version="${package_version}+sha.${revision}"
+          {
+            echo "revision=$revision"
+            echo "packages_revision=$packages_revision"
+            echo "package_version=$package_version"
+            echo "artifact_version=$artifact_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v4
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Enable pnpm
+        run: corepack enable
+
+      - name: Link shared packages
+        run: ln -sfn "$GITHUB_WORKSPACE/shared/omnilux-packages" "$GITHUB_WORKSPACE/../omnilux-packages"
+
+      - name: Install shared package dependencies
+        run: pnpm install --frozen-lockfile
+        working-directory: shared/omnilux-packages
+
+      - name: Build shared contracts
+        run: pnpm --filter @omnilux/types build && pnpm --filter @omnilux/api-contracts build
+        working-directory: shared/omnilux-packages
+
+      - name: Install relay dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Validate relay source
+        run: pnpm lint && pnpm lint:worker && pnpm test:release-config && pnpm test:smoke && pnpm build
+
+      - name: Validate release workflow helpers
+        run: node --test .github/scripts/relay-image-release.test.mjs
+
+      - name: Verify ephemeral registry readiness
+        run: node -e "fetch('http://127.0.0.1:5000/v2/').then(r => { if (!r.ok) process.exit(1) })"
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver-opts: network=host
+          buildkitd-config-inline: |
+            [registry."localhost:5000"]
+              http = true
+
+      - name: Build candidate into ephemeral registry
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: Dockerfile
+          build-contexts: |
+            omnilux-packages=./shared/omnilux-packages
+          platforms: linux/amd64
+          outputs: type=image,name=${{ env.LOCAL_CANDIDATE_IMAGE }},push-by-digest=true,name-canonical=true,push=true,registry.insecure=true
+          provenance: mode=max
+          sbom: true
+          build-args: |
+            RELAY_VERSION=${{ steps.release.outputs.artifact_version }}
+            RELAY_REVISION=${{ steps.release.outputs.revision }}
+            OMNILUX_PACKAGES_REVISION=${{ steps.release.outputs.packages_revision }}
+          labels: |
+            org.opencontainers.image.version=${{ steps.release.outputs.artifact_version }}
+            org.opencontainers.image.revision=${{ steps.release.outputs.revision }}
+            org.opencontainers.image.source=https://github.com/omnilux-tv/omnilux-relay
+            tv.omnilux.omnilux-packages.revision=${{ steps.release.outputs.packages_revision }}
+
+      - name: Resolve exact local candidate digest
+        id: exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          digest="${{ steps.build.outputs.digest }}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          exact_ref="${LOCAL_CANDIDATE_IMAGE}@${digest}"
+          {
+            echo "digest=$digest"
+            echo "local_image_ref=$exact_ref"
+            echo "release_image_ref=${RELAY_IMAGE}@${digest}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Pull and execute exact local candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_ref="${{ steps.exact.outputs.local_image_ref }}"
+          docker pull "$exact_ref"
+          smoke_container="omnilux-relay-release-smoke"
+          public_key="$(node -e "const { generateKeyPairSync } = require('node:crypto'); process.stdout.write(generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'der' }).toString('base64url'))")"
+          cleanup() {
+            docker rm -f "$smoke_container" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker run -d \
+            --name "$smoke_container" \
+            --security-opt no-new-privileges:true \
+            -e RELAY_CONTROL_URL=http://127.0.0.1:9/functions/v1 \
+            -e RELAY_GRANT_PUBLIC_KEY_SPKI_B64URL="$public_key" \
+            "$exact_ref" >/dev/null
+          ready=0
+          for attempt in $(seq 1 30); do
+            if docker exec "$smoke_container" node -e \
+              "fetch('http://127.0.0.1:8090/healthz').then((response) => { if (!response.ok) process.exit(1) }).catch(() => process.exit(1))"; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          if [[ "$ready" != "1" ]]; then
+            docker logs "$smoke_container" >&2 || true
+            exit 1
+          fi
+          test "$(docker inspect --format '{{.State.Running}}' "$smoke_container")" = "true"
+          cleanup
+          trap - EXIT
+          docker image inspect "$exact_ref" > relay-image-local-inspect.json
+
+      - name: Verify local candidate attestations and labels
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_ref="${{ steps.exact.outputs.local_image_ref }}"
+          docker buildx imagetools inspect "$exact_ref" --format '{{json .Manifest}}' > relay-image-local-manifest.json
+          docker buildx imagetools inspect "$exact_ref" --format '{{json .Provenance}}' > relay-image-local-provenance.json
+          docker buildx imagetools inspect "$exact_ref" --format '{{json .SBOM}}' > relay-image-local-sbom.json
+          node scripts/verify-relay-image-release.mjs \
+            --manifest-file relay-image-local-manifest.json \
+            --provenance-file relay-image-local-provenance.json \
+            --sbom-file relay-image-local-sbom.json \
+            --image-inspect-file relay-image-local-inspect.json \
+            --repository "$LOCAL_CANDIDATE_IMAGE" \
+            --image-ref "$exact_ref" \
+            --digest "${{ steps.exact.outputs.digest }}" \
+            --revision "${{ steps.release.outputs.revision }}" \
+            --version "${{ steps.release.outputs.artifact_version }}" \
+            --packages-revision "${{ steps.release.outputs.packages_revision }}" \
+            --platform linux/amd64 \
+            > relay-image-local-verification.json
+
+      - name: Prepare approved release tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          tags_file="$RUNNER_TEMP/relay-release-tags.txt"
+          : > "$tags_file"
+          printf '%s\n' "${RELAY_IMAGE}:sha-${{ steps.release.outputs.revision }}" >> "$tags_file"
+
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="${{ steps.release.outputs.package_version }}"
+            printf '%s\n' "${RELAY_IMAGE}:${version}" >> "$tags_file"
+            printf '%s\n' "${RELAY_IMAGE}:${version%.*}" >> "$tags_file"
+          fi
+
+          sort -u -o "$tags_file" "$tags_file"
+
+      - name: Confirm protected production release gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "${{ vars.RELAY_IMAGE_RELEASE_ENABLED }}" = "true"
+          test -s relay-image-local-verification.json
+
+      - name: Log in to GitHub Container Registry after candidate verification
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.RELAY_IMAGE }}
-          tags: |
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=semver,pattern={{major}}.{{minor}},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-
-      - name: Build image for verification
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: Dockerfile
-          build-contexts: |
-            omnilux-packages=./shared/omnilux-packages
-          load: true
-          platforms: linux/amd64
-          tags: omnilux-relay-verify:latest
-
-      - name: Verify relay artifact exists
+      - name: Install digest-preserving registry copier
+        shell: bash
         run: |
-          docker run --rm --entrypoint sh omnilux-relay-verify:latest -lc '
-            set -eu
-            test -f /app/dist/index.js
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends skopeo
+
+      - name: Promote exact verified digest without rebuild
+        shell: bash
+        run: |
+          set -euo pipefail
+          exact_ref="${{ steps.exact.outputs.local_image_ref }}"
+          seed_tag="${RELAY_IMAGE}:sha-${{ steps.release.outputs.revision }}"
+          skopeo copy \
+            --all \
+            --preserve-digests \
+            --src-tls-verify=false \
+            --dest-authfile "$HOME/.docker/config.json" \
+            "docker://${exact_ref}" \
+            "docker://${seed_tag}"
+
+          promotion_args=()
+          while IFS= read -r tag; do
+            test -n "$tag"
+            if [[ "$tag" == "$seed_tag" ]]; then
+              continue
+            fi
+            promotion_args+=(--tag "$tag")
+          done < "$RUNNER_TEMP/relay-release-tags.txt"
+          if [[ "${#promotion_args[@]}" -gt 0 ]]; then
+            docker buildx imagetools create --prefer-index=false "${promotion_args[@]}" "$seed_tag"
+          fi
+
+      - name: Verify promoted digest and copied attestations
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_digest="${{ steps.exact.outputs.digest }}"
+          release_ref="${{ steps.exact.outputs.release_image_ref }}"
+
+          while IFS= read -r tag; do
+            docker buildx imagetools inspect "$tag" --format '{{json .Manifest}}' > promoted-tag-manifest.json
+            actual_digest="$(node -p "JSON.parse(require('node:fs').readFileSync('promoted-tag-manifest.json', 'utf8')).digest")"
+            test "$actual_digest" = "$expected_digest"
+          done < "$RUNNER_TEMP/relay-release-tags.txt"
+
+          docker pull "$release_ref"
+          docker image inspect "$release_ref" > relay-image-release-inspect.json
+          docker buildx imagetools inspect "$release_ref" --format '{{json .Manifest}}' > relay-image-release-manifest.json
+          docker buildx imagetools inspect "$release_ref" --format '{{json .Provenance}}' > relay-image-release-provenance.json
+          docker buildx imagetools inspect "$release_ref" --format '{{json .SBOM}}' > relay-image-release-sbom.json
+          node scripts/verify-relay-image-release.mjs \
+            --manifest-file relay-image-release-manifest.json \
+            --provenance-file relay-image-release-provenance.json \
+            --sbom-file relay-image-release-sbom.json \
+            --image-inspect-file relay-image-release-inspect.json \
+            --repository "$RELAY_IMAGE" \
+            --image-ref "$release_ref" \
+            --digest "$expected_digest" \
+            --revision "${{ steps.release.outputs.revision }}" \
+            --version "${{ steps.release.outputs.artifact_version }}" \
+            --packages-revision "${{ steps.release.outputs.packages_revision }}" \
+            --platform linux/amd64 \
+            > relay-image-release-verification.json
+
+      - name: Capture exact release evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -e '
+            const fs = require("node:fs");
+            const evidence = JSON.parse(fs.readFileSync("relay-image-release-verification.json", "utf8"));
+            evidence.localCandidate = JSON.parse(fs.readFileSync("relay-image-local-verification.json", "utf8"));
+            evidence.promotedTags = fs.readFileSync(process.env.RUNNER_TEMP + "/relay-release-tags.txt", "utf8").trim().split("\n").filter(Boolean);
+            fs.writeFileSync("relay-image-release-evidence.json", JSON.stringify(evidence, null, 2) + "\n");
           '
 
-      - name: Build and push image
-        uses: docker/build-push-action@v6
+      - name: Upload exact release evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          context: .
-          file: Dockerfile
-          build-contexts: |
-            omnilux-packages=./shared/omnilux-packages
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          name: relay-image-${{ steps.release.outputs.revision }}
+          path: |
+            relay-image-release-evidence.json
+            relay-image-local-manifest.json
+            relay-image-local-provenance.json
+            relay-image-local-sbom.json
+            relay-image-release-manifest.json
+            relay-image-release-provenance.json
+            relay-image-release-sbom.json
+          if-no-files-found: error
